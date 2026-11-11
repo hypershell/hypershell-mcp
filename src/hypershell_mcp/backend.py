@@ -147,6 +147,21 @@ def lib() -> SimpleNamespace:
     )
 
 
+EXIT_MEANINGS: Final[dict[int, str]] = {
+    1: 'general error', 2: 'misuse of a shell builtin or bad arguments',
+    # The BSD sysexits conventions, which well-behaved tools use to say what kind of failure it was.
+    64: 'usage error (sysexits)', 65: 'bad input data (sysexits)', 66: 'cannot open input (sysexits)',
+    69: 'a service is unavailable (sysexits)', 70: 'internal software error (sysexits)',
+    71: 'operating system error (sysexits)', 73: 'cannot create output file (sysexits)',
+    74: 'input/output error (sysexits)',
+    75: 'temporary failure (sysexits): the program is asking to be retried',
+    77: 'permission denied (sysexits)', 78: 'configuration error (sysexits)',
+    126: 'command found but not executable', 127: 'command not found',
+    130: 'terminated by Ctrl-C (SIGINT)', 137: 'killed (SIGKILL): often out of memory',
+    139: 'segmentation fault (SIGSEGV)', 143: 'terminated (SIGTERM)',
+}
+
+
 def explain_exit_status(status: int | None) -> str:
     """What an exit status usually means, in a few words."""
     if status is None:
@@ -167,12 +182,8 @@ def explain_exit_status(status: int | None) -> str:
             return f'killed by {signal.Signals(-status).name}'
         except ValueError:
             return f'killed by signal {-status}'
-    known = {1: 'general error', 2: 'misuse of a shell builtin or bad arguments',
-             126: 'command found but not executable', 127: 'command not found',
-             130: 'terminated by Ctrl-C (SIGINT)', 137: 'killed (SIGKILL): often out of memory',
-             139: 'segmentation fault (SIGSEGV)', 143: 'terminated (SIGTERM)'}
-    if status in known:
-        return known[status]
+    if status in EXIT_MEANINGS:
+        return EXIT_MEANINGS[status]
     if status > 128:
         return f'exited {status}: likely killed by signal {status - 128}'
     return f'exited with status {status}'

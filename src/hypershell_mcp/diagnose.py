@@ -93,6 +93,9 @@ def advise(tasks: list[dict[str, Any]], clusters: list[FailureCluster]) -> list[
     if share(-2) >= 0.2:
         advice.append('Many tasks were interrupted, which is how a wall-time limit ends a task. Raise the '
                       'timeout, or split the work.')
+    if statuses.get(75):
+        advice.append(f'{statuses[75]} tasks exited 75, the conventional "temporary failure, try again": '
+                      'those are the ones worth retrying as they are.')
     if share(-1002) > 0:
         advice.append('Some tasks asked for more cores or memory than any client offers; they can never '
                       'start as declared.')
