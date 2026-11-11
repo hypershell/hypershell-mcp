@@ -65,8 +65,11 @@ TAG_SCAN: Final[int] = 50_000
 """Most tasks read to list the tag keys of a selection."""
 PATTERN_LIMIT: Final[int] = 300
 """Longest regular expression a caller may send."""
-PATTERN_MEMORY: Final[int] = 4 * 1024 * 1024
-"""Most memory RE2 may use for one compiled pattern, in bytes; larger patterns are refused."""
+PATTERN_MEMORY: Final[int] = 1024 * 1024
+"""
+Most memory RE2 may use for one compiled pattern, in bytes; larger patterns are refused. With the
+cache of 64 compiled patterns below, that bounds what callers' patterns can hold at 64 MB.
+"""
 MATCH_CHARS: Final[int] = 65_536
 """Most of a field a pattern is matched against."""
 QUERY_SECONDS: Final[float] = 30.0
@@ -82,7 +85,7 @@ TEMPLATE_HELP: Final[str] = (
     'whitespace-separated words')
 
 
-@functools.lru_cache(maxsize=256)
+@functools.lru_cache(maxsize=64)
 def compile_pattern(pattern: str) -> Any:
     """
     Compile a caller's regular expression with RE2, or explain why it cannot be used.
