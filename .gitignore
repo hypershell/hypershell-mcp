@@ -11,3 +11,6 @@ wheels/
 
 # Environment files
 .env
+
+# Private notes: open weaknesses and review detail, never committed
+.security/

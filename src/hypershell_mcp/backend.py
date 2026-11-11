@@ -131,6 +131,22 @@ class Deadline:
         return cls.at is not None and time.monotonic() > cls.at
 
 
+class Prepared:
+    """
+    What a database connection was given when it was opened; None until one has been.
+
+    Pattern conditions are offered only where both are in place: a pattern from a caller is never
+    handed to an engine this server has not bounded.
+    """
+
+    patterns: bool | None = None
+    deadline: bool | None = None
+
+    @classmethod
+    def bounded(cls) -> bool:
+        return bool(cls.patterns and cls.deadline)
+
+
 class BackendError(Exception):
     """An expected failure with a message that can be shown to the caller as it is."""
 
@@ -162,14 +178,17 @@ def lib() -> SimpleNamespace:
     if dbcore.engine.dialect.name == 'sqlite':
         @sqlalchemy.event.listens_for(dbcore.engine, 'connect')
         def prepare_connection(connection: Any, record: Any) -> None:
-            if hasattr(connection, 'create_function'):  # Turso's driver may not offer these
+            Prepared.patterns = hasattr(connection, 'create_function')
+            Prepared.deadline = hasattr(connection, 'set_progress_handler')
+            if Prepared.patterns:
                 connection.create_function('regexp', 2, linear_regexp)
-            if hasattr(connection, 'set_progress_handler'):
+            if Prepared.deadline:
                 connection.set_progress_handler(Deadline.expired, 20_000)
 
-        # A connection opened before now has SQLAlchemy's own REGEXP (Python's re, which can
-        # backtrack without end) and no deadline. Drop them so every connection is prepared.
+        # A connection opened before now was not prepared. Drop them so that every one is.
         dbcore.engine.dispose()
+    else:
+        Prepared.patterns = Prepared.deadline = False
     return SimpleNamespace(
         version=hypershell.__version__, sa=sqlalchemy, config=config_module.config,
         config_module=config_module, default_path=default_path,
@@ -389,6 +408,11 @@ class Backend:
         if operator in ('~', '!~'):
             if kind is not str:
                 raise BackendError(f'{name} is not text, so it cannot be matched with {operator}')
+            if Prepared.patterns is None:
+                hs.Session.connection()  # open the connection, so that what it offers is known
+            if not Prepared.bounded():
+                raise BackendError(f"conditions with {operator} are not offered on this database; compare with "
+                                   '== or select by tag instead')
             compile_pattern(raw)  # refuse a bad pattern here, with a reason, not inside the query
             expression = column.regexp_match(raw)
             return expression if operator == '~' else sa.not_(expression)

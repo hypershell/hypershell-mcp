@@ -1,6 +1,6 @@
 [project]
 name = "hypershell-mcp"
-version = "0.2.0"
+version = "0.2.0a1"
 description = "MCP server for HyperShell: many-task computing for agents"
 readme = "README.md"
 requires-python = ">=3.11"

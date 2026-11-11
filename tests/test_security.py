@@ -150,6 +150,20 @@ async def test_no_pattern_can_stall_or_exhaust_the_server(client):
     assert [task['args'] for task in page['tasks']] == ['echo fine']
 
 
+async def test_patterns_are_refused_where_they_cannot_be_bounded(client, monkeypatch):
+    """Without the linear matcher and the deadline on the connection, no caller pattern reaches the database."""
+    from hypershell_mcp.backend import Prepared
+    await client.call_tool('submit_tasks', {'commands': ['echo a.bam']})
+    assert data(await client.call_tool('list_tasks', {'select': {'where': ['args ~ bam$']}}))['total'] == 1
+    for missing in ('patterns', 'deadline'):
+        with monkeypatch.context() as patch:
+            patch.setattr(Prepared, missing, False)
+            for condition in ('args ~ bam$', 'args !~ bam$'):
+                with pytest.raises(ToolError, match='not offered on this database'):
+                    await client.call_tool('list_tasks', {'select': {'where': [condition]}})
+            assert data(await client.call_tool('list_tasks', {'select': {'where': ['exit_status == null']}}))['total'] == 1
+
+
 async def test_patterns_are_checked_before_use(client):
     with pytest.raises(ToolError, match='cannot be used as a pattern: missing'):
         await client.call_tool('list_tasks', {'select': {'where': ['args ~ (']}})

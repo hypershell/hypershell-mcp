@@ -47,10 +47,11 @@ uv run hypershell-mcp check   # what would be served
 2. **Nothing a caller below the run tier supplies may execute or choose a file.** Submit-time
    templates go through `templates.py`, never HyperShell's engine (which runs shell and Python).
    Output paths come from the database and are confined by `outputs.inside`. `tag_tasks` changes
-   tags only, and never `submitter`. `set_config` writes an allow-list. Caller regexes run under a
-   deadline (`regex`, not `re`). If you add a parameter that reaches a subprocess, a path, SQL
-   text, a JSON path or a regex, validate it and add a test to `tests/test_security.py` that tries
-   to abuse it. Deny-lists lose: the first version of the template check was bypassed by a space.
+   tags only, and never `submitter`. `set_config` writes an allow-list. Caller patterns are
+   matched by RE2 under a read deadline, and refused where a connection lacks either. If you add
+   a parameter that reaches a subprocess, a path, SQL text, a JSON path or a regex, validate it
+   and add a test to `tests/test_security.py` that tries to abuse it. Deny-lists lose: the first
+   version of the template check was bypassed by a space.
 3. **All HyperShell access goes through `Backend.call`.** One thread, one session, rollback on
    error, `Session.remove()` after. Never touch `hypershell.data` from a tool directly, and never
    import `hypershell` at module top level outside `backend.lib()`: HyperShell reads its

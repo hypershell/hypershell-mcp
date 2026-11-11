@@ -143,7 +143,7 @@ Tools that act on tasks share one `select` argument. Its fields are ANDed:
 `status` takes `pending`, `running`, `succeeded`, `failed`, `cancelled`, `completed` or
 `remaining`. A tag value of `null` means "has this tag". `where` conditions use
 `== != > >= < <= ~ !~` on any task field; `~` matches a regular expression in
-[RE2 syntax](https://github.com/google/re2/wiki/Syntax) (no backreferences or lookaround). Tools that change tasks refuse an empty selector unless
+[RE2 syntax](https://github.com/google/re2/wiki/Syntax) (no backreferences or lookaround; SQLite databases only). Tools that change tasks refuse an empty selector unless
 told `everything: true`, and `delete_tasks` previews unless told `confirm: true`.
 
 ### Resources and prompts
@@ -197,7 +197,8 @@ What the server does on its own account:
   value: nothing that decides what runs or where data lives, and no `_eval` key.
 - Regular expressions from callers (`where … ~`, output search) are matched by RE2, which runs in
   time linear in the text and compiles within a fixed memory budget, and every read is stopped
-  after 30 seconds. One caller's pattern or query cannot stall the server for the rest.
+  after 30 seconds. One caller's pattern or query cannot stall the server for the rest. On a
+  database where the server cannot install both, `~` conditions are refused.
 - Submissions are bounded: tasks per call, command length, template length, tags per task.
 - Bound to loopback, the HTTP server checks `Host` and `Origin`, which is what stops a web page
   from reaching a local server through DNS rebinding.
