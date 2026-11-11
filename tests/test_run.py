@@ -180,11 +180,32 @@ def test_cluster_options_become_the_documented_hs_arguments():
         zone='gpu', template='python run.py {}', bundlesize=10, client_cores=64, client_memory='128GB',
         client_timeout=600, monitor=True).arguments()
     assert arguments == ['cluster', '--forever', '--capture', '-N', '16', '-Q', '2', '-r', '2', '--eager',
-                         '-W', '3600', '-t', 'python run.py {}', '-b', '10', '-C', '64', '-M', '128GB',
-                         '-T', '600', '--monitor', '--zone', 'gpu', '--launcher=srun --exclusive -N1',
-                         '--autoscaling', 'dynamic', '-I', '2', '-X', '1', '-Y', '40']
-    assert ClusterOptions(launcher='ssh', hosts=['a', 'b']).arguments()[-3:] == ['--ssh', 'a', 'b']
+                         '-W', '3600', '--template=python run.py {}', '-b', '10', '-C', '64',
+                         '--client-memory=128GB', '-T', '600', '--monitor', '--zone=gpu',
+                         '--launcher=srun --exclusive -N1', '--autoscaling', 'dynamic', '-I', '2', '-X', '1',
+                         '-Y', '40']
+    assert ClusterOptions(launcher='ssh', hosts=['a', 'b']).arguments()[-1] == '--ssh=a,b'
+    assert ClusterOptions(launcher='ssh', hosts=['node[1-4]']).arguments()[-1] == '--ssh=node[1-4]'
+    assert ClusterOptions(launcher='ssh', ssh_group='gpu').arguments()[-2:] == ['--ssh', '--ssh-group=gpu']
     assert ClusterOptions(launcher='mpi').arguments()[-1] == '--mpi'
+
+
+async def test_a_cluster_with_a_zone_and_a_client_template_runs_only_its_tasks(client):
+    """The free-text options reach hs intact, and behave as documented."""
+    theirs = data(await client.call_tool('submit_tasks', {'commands': ['alpha beta'], 'zone': 'lab-1'}))
+    other = data(await client.call_tool('submit_tasks', {'commands': ['echo not for this cluster']}))
+    started = data(await client.call_tool('start_cluster', {'options': {
+        'mode': 'forever', 'workers': 1, 'zone': 'lab-1', 'template': "echo 'got: {}' # literal"}}))
+    assert "--zone=lab-1" in started['command'] and started['zone'] == 'lab-1'
+    waited = data(await client.call_tool('wait_for_tasks', {'select': {'batch': theirs['batch']}, 'timeout': 60}))
+    assert waited['done'] is True and waited['counts']['succeeded'] == 1
+    output = data(await client.call_tool('get_task_output', {'task_id': theirs['ids'][0]}))
+    assert output['text'] == 'got: alpha beta\n'
+    # The task without a zone was not run: this cluster's client serves lab-1 only. (The scheduler
+    # has staged it for a default-zone client, which HyperShell records as scheduled.)
+    left = data(await client.call_tool('summarize_tasks', {'select': {'batch': other['batch']}}))
+    assert [(row['key']['status'], row['count']) for row in left['rows']] in ([('running', 1)], [('pending', 1)])
+    await client.call_tool('stop_cluster', {'how': 'kill'})
 
 
 async def test_database_upkeep(client, site):
@@ -220,7 +241,8 @@ async def test_set_config_writes_the_site_file_and_protects_its_own_section(clie
     assert written['ok'] is True and written['path'] == str(site / 'config.toml'), written
     assert 'timeout = 120' in (site / 'config.toml').read_text()
     (site / 'config.toml').unlink()
-    with pytest.raises(ToolError, match="own security settings"):
-        await client.call_tool('set_config', {'key': 'mcp.jwt.secret', 'value': 'x' * 40})
-    with pytest.raises(ToolError, match='not a configuration name'):
-        await client.call_tool('set_config', {'key': 'timeout', 'value': 1})
+    for key in ('mcp.jwt.secret', 'timeout', 'database.file', 'export.PATH', 'server.auth', 'task.cwd',
+                'autoscale.launcher', 'ssh.nodelist', 'task.timeout_eval', 'database.x_eval'):
+        with pytest.raises(ToolError, match='not settable through this server'):
+            await client.call_tool('set_config', {'key': key, 'value': 'x'})
+    assert not (site / 'config.toml').exists()

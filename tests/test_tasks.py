@@ -82,7 +82,7 @@ async def test_template_builds_commands_and_refuses_code(client):
     await submit(client, ['data/run1/a.fastq', 'b.fastq'], template='align --in {} --out {/-}.bam')
     assert sorted(task['args'] for task in await listed(client, fields=['args'])) == [
         'align --in b.fastq --out b.bam', 'align --in data/run1/a.fastq --out a.bam']
-    for unsafe in ('{% rm -rf @ %}', 'echo {= __import__("os").getpid() =}'):
+    for unsafe in ('{% rm -rf @ %}', 'echo {= __import__("os").getpid() =}', '{ % id % } {}'):
         with pytest.raises(ToolError, match='would run on the server'):
             await submit(client, ['x'], template=unsafe)
 
@@ -92,8 +92,10 @@ async def test_bad_submissions_are_explained(client):
         await submit(client, ['echo a\necho b'])
     with pytest.raises(ToolError, match="cannot read 'lots' as memory"):
         await submit(client, ['x'], memory='lots')
-    with pytest.raises(ToolError, match='cannot submit'):
+    with pytest.raises(ToolError, match='invalid tag key'):
         await submit(client, ['x'], tags={'bad key!': 1})
+    with pytest.raises(ToolError, match='cannot submit'):
+        await submit(client, ['x'], tags={'ok': 'bad value!'})
     assert data(await client.call_tool('status', {}))['tasks']['total'] == 0
 
 
@@ -204,7 +206,7 @@ async def test_cancel_retry_and_tag(client):
                                                         'remove': ['batch']}))
     assert tagged['changed'] == 3
     assert all(task['tag'] == {'reviewed': True, 'note': 'ok'} for task in await listed(client, fields=['tag']))
-    with pytest.raises(ToolError, match='cannot be set as tags'):
+    with pytest.raises(ToolError, match='reads it as a task option'):
         await client.call_tool('tag_tasks', {'select': {'tags': {'note': 'ok'}}, 'set': {'cores': 4}})
 
 

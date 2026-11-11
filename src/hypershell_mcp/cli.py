@@ -44,9 +44,27 @@ def choose_site(site: str | None) -> None:
 
 
 def configured() -> dict[str, Any]:
-    """The ``[mcp]`` section of the HyperShell configuration."""
+    """
+    The ``[mcp]`` section of the HyperShell configuration.
+
+    HyperShell's configuration lets a value be given indirectly: ``secret_env = "NAME"`` reads an
+    environment variable and ``secret_eval = "command"`` runs a command, both resolved when the
+    plain name is read as an attribute. The jwt section is read that way here, so a secret need
+    not sit in the file.
+    """
     from hypershell_mcp.backend import lib
-    return dict(lib().config.get('mcp') or {})
+    section = lib().config.get('mcp')
+    if not section:
+        return {}
+    found = dict(section)
+    jwt = section.get('jwt')
+    if jwt:
+        resolved = {}
+        for name in jwt:
+            base = name.rsplit('_', 1)[0] if name.endswith(('_env', '_eval')) else name
+            resolved[base] = getattr(jwt, base)
+        found['jwt'] = resolved
+    return found
 
 
 def handled() -> dict[type[Exception], Any]:
@@ -173,7 +191,10 @@ class ServeApp(Application):
         if settings.anonymous:
             print(f'{PROGRAM}: serving WITHOUT authentication on {settings.host}:{settings.port}: anyone who '
                   'can reach this port can run commands as you', file=sys.stderr)
-        server.run('http', host=settings.host, port=settings.port, path=settings.path, show_banner=False)
+        # 'auto' checks the Host and Origin headers whenever the server is bound to loopback, which
+        # is what stops a web page from reaching it through DNS rebinding.
+        server.run('http', host=settings.host, port=settings.port, path=settings.path, show_banner=False,
+                   host_origin_protection='auto')
 
     @classmethod
     def main(cls, argv: list[str] | None = None, **kwargs: Any) -> int:

@@ -131,3 +131,58 @@ async def test_served_over_http_with_a_token(environment, tmp_path):
         server.terminate()
         server.wait(timeout=10)
     assert server.stdout.read() == b''
+
+
+async def serving(environment, *options: str):
+    """Start the server over HTTP on a free port; returns (process, port) once it accepts connections."""
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    server = subprocess.Popen([*PROGRAM, '--transport', 'http', '--port', str(port), *options],
+                              env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for _ in range(100):
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=0.2):
+                return server, port
+        except OSError:
+            assert server.poll() is None, server.stderr.read().decode()
+            await asyncio.sleep(0.1)
+    server.kill()
+    raise AssertionError('the server did not start listening')
+
+
+async def test_a_local_server_refuses_requests_addressed_to_another_host(environment):
+    """
+    DNS rebinding: a web page rebinds its own name to 127.0.0.1 and has the browser call a local
+    server, which sees a foreign Host and Origin. With --no-auth that would hand the page every tool.
+    """
+    import httpx2
+    server, port = await serving(environment, '--no-auth')
+    body = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+            'params': {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 't', 'version': '0'}}}
+    accept = {'Accept': 'application/json, text/event-stream'}
+    try:
+        async with httpx2.AsyncClient(base_url=f'http://127.0.0.1:{port}') as http:
+            assert (await http.post('/mcp', json=body, headers=accept)).status_code == 200
+            for foreign in ({'Host': f'evil.example:{port}'}, {'Origin': 'http://evil.example'},
+                            {'Host': f'evil.example:{port}', 'Origin': f'http://evil.example:{port}'}):
+                refused = await http.post('/mcp', json=body, headers={**accept, **foreign})
+                assert refused.status_code in (400, 403, 421), (foreign, refused.status_code)
+    finally:
+        server.terminate()
+        server.wait(timeout=10)
+
+
+async def test_the_secret_can_come_from_the_environment_through_the_config(environment, tmp_path):
+    """`secret_env` in the config names a variable to read, so the secret itself is not on disk."""
+    secret = auth.generate_secret()
+    Path(environment['HYPERSHELL_CONFIG_FILE']).write_text('[mcp.jwt]\nsecret_env = "MY_MCP_SECRET"\nissuer = "lab"\n')
+    environment['MY_MCP_SECRET'] = secret
+    shown = run(environment, 'check', '--transport', 'http')
+    assert shown.returncode == 0 and 'JWT HS256 (issuer lab' in shown.stdout, shown.stderr
+    issued = run(environment, 'token', '--scopes', 'read')
+    access = await auth.build_verifier(auth.AuthSettings(secret=secret, issuer='lab')).load_access_token(
+        issued.stdout.strip())
+    assert access is not None and access.scopes == ['hypershell:read']
+    del environment['MY_MCP_SECRET']
+    assert run(environment, 'check', '--transport', 'http').returncode == 3

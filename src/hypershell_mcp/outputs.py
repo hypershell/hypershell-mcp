@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 from typing import Final, Literal
+
+import regex
 
 from hypershell_mcp.models import OutputChunk
 
@@ -23,6 +26,12 @@ __all__ = ['read_output', 'tail_text', 'SCAN_LIMIT']
 
 SCAN_LIMIT: Final[int] = 64 * 1024 * 1024
 """Most bytes searched for a pattern in one file."""
+LINE_LIMIT: Final[int] = 65_536
+"""Longest stretch treated as one line; a file with no newlines is searched in pieces this size."""
+PATTERN_LIMIT: Final[int] = 300
+"""Longest regular expression a caller may send."""
+SEARCH_SECONDS: Final[float] = 5.0
+"""Longest one search of one file may take."""
 
 
 def inside(path: Path, roots: tuple[Path, ...]) -> bool:
@@ -92,8 +101,11 @@ def read_output(task_id: str, stream: Literal['stdout', 'stderr'], path: str | N
                     pieces = pieces[1:]  # the first piece is the end of a line cut by the seek
                 kept = pieces[-lines:] if lines else []
                 truncated = size > max_bytes or len(pieces) > lines
-    except re.error as error:
+    except regex.error as error:
         return missing(f'The pattern is not a valid regular expression: {error}')
+    except TimeoutError:
+        return missing(f'The pattern took longer than {SEARCH_SECONDS:.0f} s on this file and was abandoned. '
+                       'Simplify it: overlapping alternatives such as (a|aa)+ are the usual cause.')
     except OSError as error:
         return missing(f'Cannot read {path}: {error.strerror}')
     return OutputChunk(task_id=task_id, stream=stream, available=True, text=decode(b''.join(kept)),
@@ -102,17 +114,29 @@ def read_output(task_id: str, stream: Literal['stdout', 'stderr'], path: str | N
 
 def search(task_id: str, stream: Literal['stdout', 'stderr'], file: Path, size: int, pattern: str,
            lines: int, max_bytes: int) -> OutputChunk:
-    """Lines matching `pattern`, numbered, up to `lines` of them and `max_bytes` of text."""
-    expression = re.compile(pattern)
+    """
+    Lines matching `pattern`, numbered, up to `lines` of them and `max_bytes` of text.
+
+    The search is bounded three ways, since the pattern and the file both come from outside: the
+    pattern's length, the bytes scanned, and the time spent. The `regex` module is used because it
+    can abandon a match that backtracks without end; `re` cannot.
+    """
+    if len(pattern) > PATTERN_LIMIT:
+        raise regex.error(f'it is {len(pattern)} characters; the limit is {PATTERN_LIMIT}')
+    expression = regex.compile(pattern)
+    deadline = time.monotonic() + SEARCH_SECONDS
     found: list[str] = []
     matches = used = scanned = 0
     with open(file, 'rb') as handle:
-        for number, raw in enumerate(handle, start=1):
+        for number, raw in enumerate(iter(lambda: handle.readline(LINE_LIMIT), b''), start=1):
             scanned += len(raw)
             if scanned > SCAN_LIMIT:
                 break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
             line = decode(raw).rstrip('\n')
-            if expression.search(line):
+            if expression.search(line, timeout=remaining):
                 matches += 1
                 entry = f'{number}: {line}'
                 if len(found) < lines and used + len(entry) <= max_bytes:

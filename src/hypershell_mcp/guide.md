@@ -26,7 +26,7 @@ Every tool that acts on tasks takes the same `select` object. Fields are ANDed.
 |---|---|
 | `batch` | The id returned by `submit_tasks` / `run_tasks` |
 | `ids` | Exact task ids |
-| `status` | Any of `pending` `running` `succeeded` `failed` `cancelled` `completed` `remaining` |
+| `status` | Any of `pending` `running` `succeeded` `failed` `cancelled` `completed` `remaining`. `running` means handed out by the scheduler and not finished, which includes tasks staged for a client that has not started them yet |
 | `tags` | `{"key": value}` to match a value, `{"key": null}` to match presence |
 | `group`, `zone` | Task group number; zone name (`default` = no zone) |
 | `where` | Conditions `FIELD OP VALUE` with `== != > >= < <= ~ !~`, e.g. `exit_status == 137`, `duration > 600`, `args ~ \.bam$`, `client_host == node042` |
@@ -53,7 +53,11 @@ one command per input.
 | `{-}` | path without extension | `data/run1/a` |
 | `{.}` | directory | `data/run1` |
 | `{+}` | extension | `.fastq` |
-| `{[0]}`, `{[1:3]}` | whitespace-separated words of the input | |
+| `{[0]}`, `{[1:3]}`, `{[-1]}` | whitespace-separated words of the input | |
+
+Other braces are ordinary text, so `awk '{print $1}' {}` works. HyperShell's shell (`{% %}`) and
+Python (`{= =}`) patterns are refused at submit; a cluster can apply them when it runs the tasks
+(`start_cluster`, `options.template`).
 
 ## Groups and zones
 

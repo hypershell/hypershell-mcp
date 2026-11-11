@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Annotated, Literal
 
 from fastmcp import Context, FastMCP
@@ -15,7 +16,7 @@ from pydantic import Field
 from hypershell_mcp.app import App
 from hypershell_mcp.auth import Tier
 from hypershell_mcp.backend import BackendError
-from hypershell_mcp.clusters import ClusterOptions
+from hypershell_mcp.clusters import ClusterError, ClusterOptions
 from hypershell_mcp.models import ClusterInfo, RunResult, StatusCounts, TaskResult, TaskSelector
 from hypershell_mcp.tools import tool
 from hypershell_mcp.tools.read import wait_until_done
@@ -89,6 +90,8 @@ def register(mcp: FastMCP, app: App) -> None:
         pending run too. For long campaigns, or to run on other nodes, use submit_tasks and
         start_cluster and check back with wait_for_tasks.
         """
+        if cwd is not None and not Path(cwd).expanduser().is_dir():
+            raise BackendError(f'the working directory {cwd} does not exist; nothing was submitted')
         submitted = await submit(app, commands, template=template, tags=tags, group=None, zone=None, cores=None,
                                  memory=None, timeout=task_timeout, batch=None)
         selector = TaskSelector(batch=submitted.batch)
@@ -112,7 +115,12 @@ def register(mcp: FastMCP, app: App) -> None:
                 return (f'{counts.remaining} tasks are still unfinished after {starts} clusters started and '
                         'exited without running them. list_clusters shows their logs.')
             starts += 1
-            used.append(await start(ClusterOptions(workers=workers, mode='drain', cwd=cwd), force=False))
+            try:
+                used.append(await start(ClusterOptions(workers=workers, mode='drain', cwd=cwd), force=False))
+            except (BackendError, ClusterError) as failure:
+                # The tasks are already queued. Say so with the batch, rather than raise and leave
+                # the caller not knowing that a second attempt would submit them twice.
+                return f'The tasks are submitted but no cluster could be started for them: {failure}'
             return None
 
         waited = await wait_until_done(app, ctx, selector, float(min(timeout, limits.wait)), when_unserved=serve)

@@ -8,9 +8,9 @@ however many workers you give it, from a laptop to a leadership-class machine. T
 that behind 23 tools an agent can call, with typed results, over stdio for local use or over HTTP
 with JWT authentication.
 
-> **Status: a spike.** Built against HyperShell 2.9.0a6 and FastMCP 4.1. It works end to end and
-> has a test suite that runs real clusters, but it has not been used in anger. See
-> [`DESIGN.md`](DESIGN.md) for what was decided and what is still open.
+> **Status: a spike.** Built against HyperShell 2.9.0a6 and FastMCP 4.1. It works end to end, has
+> a test suite that runs real clusters, and has been through one adversarial review, but it has
+> not been used in anger. See [`DESIGN.md`](DESIGN.md) for what was decided and what is still open.
 
 ## What it looks like
 
@@ -106,7 +106,7 @@ them at all.
 | **submit** | `submit_tasks` | Add tasks to the queue. |
 | **manage** | `cancel_tasks` `retry_tasks` `tag_tasks` `delete_tasks` | Change tasks that exist. |
 | **run** | `run_tasks` `start_cluster` `stop_cluster` | Start and stop the clusters that execute tasks. |
-| **admin** | `init_database` `vacuum_database` `backup_database` `rotate_database` `set_config` | Database upkeep and configuration. |
+| **admin** | `init_database` `vacuum_database` `backup_database` `rotate_database` `set_config` | Database upkeep and scheduling settings. |
 
 A few are worth knowing about:
 
@@ -116,9 +116,10 @@ A few are worth knowing about:
 - **`run_tasks`** submits commands, makes sure a cluster is serving the queue, waits, and returns
   each command's exit status and output. A parallel `for` loop in one call.
 - **`submit_tasks`** returns a **batch id**. Every other tool accepts `{"batch": id}` to mean
-  exactly those tasks.
+  exactly those tasks. `dry_run` shows the commands a templated submission would store.
 - **`summarize_tasks`** counts tasks by any mix of status, group, zone, exit status, host or tag
-  value, with duration statistics: "which values of `alpha` fail", "which nodes are slow".
+  value, with duration statistics: "which values of `alpha` fail", "which nodes are slow". Add a
+  time bucket (`completed:hour`) and it becomes a timeline: throughput, and when failures began.
 - **`diagnose_failures`** groups failed tasks by exit status and the last line of stderr with ids,
   paths and numbers masked, so ten thousand failures read as the three causes they are.
 - **`wait_for_tasks`** blocks with progress reports, and returns early, saying so, when tasks are
@@ -162,9 +163,9 @@ Be clear about what this is: **a server that runs shell commands.** A task is a 
 a cluster executes tasks as the user the server runs as.
 
 - **Tiers limit what a token can do by itself.** A `read` token can look and nothing else. A
-  `submit` token can queue commands but not start anything that runs them. Only `run` can execute,
-  and only `admin` can touch the database files or configuration. Give each caller the least that
-  does the job, with a short `--ttl`.
+  `submit` token can queue commands but not start anything that runs them. Only `run` can execute.
+  `admin` can compact, back up and rotate the database and change scheduling settings, and cannot
+  execute either. Give each caller the least that does the job, with a short `--ttl`.
 - **But queued commands do run once anyone starts a cluster.** `submit` is therefore a deferred
   form of `run`: treat a `submit` token as able to execute, on whoever's cluster drains the queue.
 - **Anything a task can do, the server's user can do**, including reading the signing secret if it
@@ -182,13 +183,18 @@ What the server does on its own account:
 - Tokens must be signed with the configured key and algorithm, carry `exp` (and not be past it),
   match the issuer and audience, and not have a future `nbf`. Secrets shorter than 32 bytes are
   refused at startup.
-- Commands are stored exactly as given. Submit-time templates are limited to text substitution;
-  HyperShell's shell (`{% %}`) and Python (`{= =}`) expansions are refused, because they would run
-  inside the server for a caller who may only submit.
+- Commands are stored exactly as given. Submit-time templates are expanded by this server's own
+  text-only expander and never reach HyperShell's template engine, whose shell (`{% %}`) and
+  Python (`{= =}`) patterns would run inside the server for a caller who may only submit.
 - Task output is read only from the site's task-output directory (plus any listed in
   `mcp.outputs`), with symlinks resolved, because output paths are data in the database.
-- `get_config` masks keys, passwords, secrets and tokens. `set_config` cannot change the `mcp`
-  section.
+- `get_config` masks keys, passwords, secrets and tokens, everything under `export`, and the
+  credentials and query string of any URL. `set_config` writes only an allow-list of scheduling and
+  limit settings: nothing that decides what runs or where data lives, and no `_eval` key.
+- Regular expressions from callers (`where … ~`, output search) are length-limited and run with a
+  deadline, so one caller's pattern cannot stall the server for the rest.
+- Bound to loopback, the HTTP server checks `Host` and `Origin`, which is what stops a web page
+  from reaching a local server through DNS rebinding.
 - The server's own `HYPERSHELL_MCP_*` environment is stripped from every cluster it starts, so it
   does not reach tasks.
 - Every call outside the read tier is appended to `<site>/mcp/audit.jsonl`: time, token subject,

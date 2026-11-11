@@ -29,6 +29,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Final, Iterable, TypeVar
 
+import regex
+
+from hypershell_mcp.templates import TemplateError, compile_template
 from hypershell_mcp.models import (STATES, DatabaseInfo, QueueInfo, StatusCounts, TagIndex,
                                    TaskGroupRow, TaskSelector, TaskSpec, TaskSummary)
 
@@ -54,7 +57,12 @@ POSTGRES_BUCKET: Final[dict[str, str]] = {'minute': 'YYYY-MM-DD HH24:MI', 'hour'
 OPERATORS: Final[tuple[str, ...]] = ('==', '!=', '>=', '<=', '!~', '>', '<', '~')
 WHERE: Final[re.Pattern[str]] = re.compile(r'^\s*([a-z_]+)\s*(==|!=|>=|<=|!~|>|<|~)\s*(.*?)\s*$')
 TAG_KEY: Final[re.Pattern[str]] = re.compile(r'^[A-Za-z0-9_.+-]{1,120}$')
-UNSAFE_TEMPLATE: Final[re.Pattern[str]] = re.compile(r'\{[%=]')
+TAG_SCAN: Final[int] = 50_000
+"""Most tasks read to list the tag keys of a selection."""
+PATTERN_LIMIT: Final[int] = 300
+"""Longest regular expression a caller may send."""
+MATCH_SECONDS: Final[float] = 0.25
+"""Longest one regular-expression match may run before the whole query is abandoned."""
 CHUNK: Final[int] = 500
 """Rows per statement when changing many tasks, well under SQLite's bound-variable limit."""
 
@@ -62,6 +70,36 @@ TEMPLATE_HELP: Final[str] = (
     "'{}' is the whole input; '{/}' its basename; '{/-}' the basename without extension; '{.}' its "
     "directory; '{-}' the path without extension; '{+}' the extension; '{[0]}' or '{[1:3]}' "
     'whitespace-separated words')
+
+
+def check_pattern(pattern: str) -> str:
+    """Return `pattern` if it is a usable regular expression of reasonable size, else explain."""
+    if len(pattern) > PATTERN_LIMIT:
+        raise BackendError(f'the pattern is {len(pattern)} characters; the limit is {PATTERN_LIMIT}')
+    try:
+        regex.compile(pattern)
+    except regex.error as error:
+        raise BackendError(f'{pattern!r} is not a valid regular expression: {error}') from None
+    return pattern
+
+
+def bounded_regexp(pattern: str | None, text: str | None) -> bool | None:
+    """
+    SQLite's REGEXP, with a deadline.
+
+    SQLite calls back into Python for every row, on the one thread all database work shares. A
+    pattern that backtracks without end (``(a+)+$`` against a long run of ``a``) would hold that
+    thread, and with it every caller. The `regex` module can abandon a match; `re` cannot.
+    """
+    if pattern is None or text is None:
+        return None
+    try:
+        return regex.search(pattern, text, timeout=MATCH_SECONDS) is not None
+    except TimeoutError:
+        raise RuntimeError(SLOW_PATTERN) from None
+
+
+SLOW_PATTERN: Final[str] = 'hypershell-mcp: regular expression abandoned as too slow'
 
 
 class BackendError(Exception):
@@ -85,7 +123,6 @@ def lib() -> SimpleNamespace:
         import sqlalchemy
         from hypershell.core import config as config_module
         from hypershell.core.platform import default_path
-        from hypershell.core.template import Template
         from hypershell.core.types import parse_bytes
         from hypershell.data import core as dbcore
         from hypershell.data import ensuredb
@@ -93,9 +130,17 @@ def lib() -> SimpleNamespace:
     except SystemExit as exit_:
         raise BackendError(f'HyperShell could not start (exit status {exit_.code}): its configuration '
                            "is not usable. Run 'hs config get database' in the same environment to see why.") from None
+    if dbcore.engine.dialect.name == 'sqlite':
+        @sqlalchemy.event.listens_for(dbcore.engine, 'connect')
+        def install_bounded_regexp(connection: Any, record: Any) -> None:
+            if hasattr(connection, 'create_function'):  # Turso's driver may not offer it
+                connection.create_function('regexp', 2, bounded_regexp)
+
+        # A connection opened before now has SQLAlchemy's own REGEXP, which has no deadline.
+        dbcore.engine.dispose()
     return SimpleNamespace(
         version=hypershell.__version__, sa=sqlalchemy, config=config_module.config,
-        config_module=config_module, default_path=default_path, Template=Template,
+        config_module=config_module, default_path=default_path,
         parse_bytes=parse_bytes, db=dbcore, Session=dbcore.Session, ensuredb=ensuredb, model=model,
         Task=model.Task, Client=model.Client, Zone=model.Zone, Source=model.Source,
         CANCEL_STATUS=model.CANCEL_STATUS, DEFAULT_ZONE_NAME=model.DEFAULT_ZONE_NAME,
@@ -164,8 +209,11 @@ class Backend:
         except hs.model.NotFound as error:
             hs.Session.rollback()
             raise NotFound(str(error) or 'not found') from None
-        except Exception:
+        except Exception as error:
             hs.Session.rollback()
+            if SLOW_PATTERN in str(error) or 'user-defined function raised exception' in str(error):
+                raise BackendError('The regular expression took too long on some task and was abandoned. '
+                                   'Simplify it: overlapping alternatives such as (a|aa)+ are the usual cause.') from None
             raise
         finally:
             hs.Session.remove()
@@ -255,7 +303,7 @@ class Backend:
     def tag_filter(key: str, value: Any) -> Any:
         """Match a tag by presence (`value` None) or by value, on SQLite/Turso and PostgreSQL."""
         hs = lib()
-        if not TAG_KEY.match(key):
+        if not TAG_KEY.fullmatch(key):
             raise BackendError(f'invalid tag key {key!r}: use letters, digits and _ . + -')
         Task, sa = hs.Task, hs.sa
         sqlite = hs.db.engine.dialect.name == 'sqlite'
@@ -293,16 +341,27 @@ class Backend:
         if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in '\'"':
             raw = raw[1:-1]
         if operator in ('~', '!~'):
-            expression = column.regexp_match(raw)
+            if kind is not str:
+                raise BackendError(f'{name} is not text, so it cannot be matched with {operator}')
+            expression = column.regexp_match(check_pattern(raw))
             return expression if operator == '~' else sa.not_(expression)
         value = cls.coerce(name, kind, raw)
-        if name == 'zone':
+        if name == 'zone' or kind is bool:
             if operator not in ('==', '!='):
-                raise BackendError('zone can only be compared with == or !=')
+                raise BackendError(f'{name} can only be compared with == or !=')
             if value is None:
                 return column.is_(None) if operator == '==' else column.isnot(None)
-        return {'==': column == value, '!=': column != value, '>': column > value,
-                '>=': column >= value, '<': column < value, '<=': column <= value}[operator]
+        if operator == '==':
+            return column == value
+        if operator == '!=':
+            return column != value
+        if operator == '>':
+            return column > value
+        if operator == '>=':
+            return column >= value
+        if operator == '<':
+            return column < value
+        return column <= value
 
     @staticmethod
     def coerce(name: str, kind: type, raw: str) -> Any:
@@ -482,7 +541,7 @@ class Backend:
                 keys.append(cls.status_expression())
             elif name in GROUPABLE:
                 keys.append(getattr(Task, name))
-            elif name.startswith('tag:') and TAG_KEY.match(name[4:]):
+            elif name.startswith('tag:') and TAG_KEY.fullmatch(name[4:]):
                 key = name[4:]
                 keys.append(func.json_extract(Task.tag, f'$."{key}"') if sqlite else Task.tag[key].astext)
             elif name in BUCKETS:
@@ -586,16 +645,16 @@ class Backend:
                 statement = hs.sa.text('select distinct j.key from task, json_each(task.tag) as j order by 1')
                 if conditions:
                     # json_each cannot be combined with ORM filters cheaply; fall back to scanning
-                    keys = sorted({name for (tag,) in hs.Session.query(Task.tag).filter(*conditions).limit(50_000)
-                                   for name in (tag or {})})
-                else:
-                    keys = [row[0] for row in hs.Session.execute(statement)]
+                    scanned = hs.Session.query(Task.tag).filter(*conditions).limit(TAG_SCAN + 1).all()
+                    keys = sorted({name for (tag,) in scanned[:TAG_SCAN] for name in (tag or {})})
+                    return TagIndex(keys=keys[:limit], truncated=len(keys) > limit or len(scanned) > TAG_SCAN)
+                keys = [row[0] for row in hs.Session.execute(statement)]
             else:
                 keys = [row[0] for row in hs.Session.query(func.jsonb_object_keys(Task.tag)).filter(*conditions)
                         .distinct().all()]
                 keys.sort()
             return TagIndex(keys=keys[:limit], truncated=len(keys) > limit)
-        if not TAG_KEY.match(key):
+        if not TAG_KEY.fullmatch(key):
             raise BackendError(f'invalid tag key {key!r}')
         value = func.json_extract(Task.tag, f'$."{key}"') if sqlite else Task.tag[key].astext
         records = (hs.Session.query(value, func.count(Task.id)).filter(*conditions, cls.tag_filter(key, None))
@@ -616,8 +675,8 @@ class Backend:
 
         Commands are stored verbatim: nothing after a ``#`` is stripped and no inline tag comment
         is read, because per-task options have their own fields here. The submit-time template is
-        limited to textual patterns; shell and Python expansions are refused, since they would run
-        on this host for anyone allowed to submit.
+        expanded by `hypershell_mcp.templates`, which only rearranges text; HyperShell's own engine,
+        which can run shell and Python, never sees a caller's template.
         """
         hs = lib()
         Task = hs.Task
@@ -625,24 +684,27 @@ class Backend:
             raise BackendError('nothing to submit: give at least one command')
         expand: Callable[[str], str] = lambda text: text
         if template and template != '{}':
-            if UNSAFE_TEMPLATE.search(template):
-                raise BackendError("the submit template may not use '{% %}' (shell) or '{= =}' (Python) "
-                                   f'expansions, which would run on the server. Use: {TEMPLATE_HELP}')
-            compiled = hs.Template(template)
+            try:
+                compiled = compile_template(template)
+            except TemplateError as error:
+                raise BackendError(f'{error}. Patterns: {TEMPLATE_HELP}') from None
 
             def expand(text: str) -> str:
                 try:
-                    return compiled.expand(text)
-                except Exception as error:
-                    raise BackendError(f'the template {template!r} failed on {text!r}: {error}') from None
+                    return compiled(text)
+                except TemplateError as error:
+                    raise BackendError(str(error)) from None
 
         batch = batch or cls.new_batch_id()
-        if not TAG_KEY.match(batch):
+        if not TAG_KEY.fullmatch(batch):
             raise BackendError(f'invalid batch id {batch!r}: use letters, digits and _ . + -')
-        shared = {**(tags or {})}
-        shared.setdefault('batch', batch)
+        cls.check_tags(tags)
+        # Set after the caller's tags, and again after each task's: who submitted a task and
+        # which batch it belongs to are this server's to say.
+        stamped = {'batch': batch}
         if submitter:
-            shared.setdefault('submitter', re.sub(r'[^A-Za-z0-9_.+-]', '_', submitter)[:120])
+            stamped['submitter'] = re.sub(r'[^A-Za-z0-9_.+-]', '_', submitter)[:120]
+        shared = {**(tags or {}), **stamped}
         if group is None:
             group = Task.current_group().value
         zone_id = None
@@ -655,6 +717,7 @@ class Backend:
         new = []
         for item in tasks:
             spec = item if isinstance(item, TaskSpec) else TaskSpec(command=item)
+            cls.check_tags(spec.tags)
             command = expand(spec.command.strip())
             if not command:
                 raise BackendError('a command is empty')
@@ -663,7 +726,7 @@ class Backend:
             try:
                 new.append(Task.new(
                     args=command, raw_args=spec.command.strip(), parse_inline=False,
-                    tag={**shared, **{k: v for k, v in (spec.tags or {}).items() if v is not None}},
+                    tag={**shared, **{k: v for k, v in (spec.tags or {}).items() if v is not None}, **stamped},
                     group=spec.group if spec.group is not None else group, source=source, zone=zone_id,
                     cores=spec.cores or cores, memory=cls.parse_memory(spec.memory) or shared_memory,
                     timeout=spec.timeout or timeout))
@@ -681,6 +744,36 @@ class Backend:
         for start in range(0, len(new), CHUNK):
             Task.add_all(new[start:start + CHUNK])
         return {**result, 'would_submit': None}
+
+    OPTION_TAGS: Final[frozenset[str]] = frozenset({'group', 'cores', 'memory', 'timeout'})
+    """Tag names HyperShell lifts into task columns, untyped. Never accepted as tags here."""
+
+    STAMPED_TAGS: Final[frozenset[str]] = frozenset({'batch', 'submitter'})
+    """Tags this server sets on what it submits."""
+
+    @classmethod
+    def check_tags(cls, tags: dict[str, Any] | None, *, changing: bool = False) -> None:
+        """
+        Refuse tag names that are not the caller's to set.
+
+        HyperShell moves tags named group, cores, memory and timeout into the task's columns
+        without checking their type, so `{"group": "control"}` would store a string where the
+        scheduler expects a number and break every query that sorts on it. Those are options, with
+        their own typed fields. `submitter` records who submitted a task and is never caller-set;
+        `batch` is set through the batch argument at submit, and may be changed afterwards.
+        """
+        names = set(tags or {})
+        for name in names:
+            if not TAG_KEY.fullmatch(str(name)):
+                raise BackendError(f'invalid tag key {name!r}: use letters, digits and _ . + -')
+        options = sorted(names & cls.OPTION_TAGS)
+        if options:
+            raise BackendError(f"{', '.join(options)} cannot be used as a tag name: HyperShell reads it as a "
+                               'task option. Use the argument of that name instead.')
+        stamped = sorted(names & ({'submitter'} if changing else cls.STAMPED_TAGS))
+        if stamped:
+            raise BackendError(f"{', '.join(stamped)} is set by the server and cannot be given as a tag"
+                               + ('' if changing else '; to choose the batch, use the batch argument'))
 
     @staticmethod
     def parse_memory(text: str | None) -> int | None:
@@ -731,15 +824,10 @@ class Backend:
             note = 'Running tasks are not deleted; cancel them first, or wait for them.'
         elif action == 'tag':
             eligible = sa.true()
-            for key in [*(set_tags or {}), *(remove_tags or [])]:
-                if not TAG_KEY.match(key):
-                    raise BackendError(f'invalid tag key {key!r}: use letters, digits and _ . + -')
             if not set_tags and not remove_tags:
                 raise BackendError('nothing to change: give tags to set or tag keys to remove')
-            reserved = {'group', 'cores', 'memory', 'timeout'} & set(set_tags or {})
-            if reserved:
-                raise BackendError(f"{', '.join(sorted(reserved))} cannot be set as tags: HyperShell treats "
-                                   'those names as task options at submit time')
+            cls.check_tags(set_tags, changing=True)
+            cls.check_tags(dict.fromkeys(remove_tags or []), changing=True)
         else:
             raise BackendError(f'unknown action {action!r}')
 
@@ -782,19 +870,44 @@ class Backend:
     # Configuration
 
     SECRET_WORDS: Final[tuple[str, ...]] = ('auth', 'password', 'secret', 'token', 'key', 'passwd', 'credential')
+    PLACEHOLDERS: Final[tuple[Any, ...]] = (None, '', '<none>', '<auto>', '<not-secure>')
+    MASK: Final[str] = '********'
 
     @classmethod
-    def redact(cls, value: Any, name: str = '') -> Any:
-        """A copy of a configuration value with anything secret-looking masked."""
-        if isinstance(value, dict):
-            return {key: cls.redact(item, str(key)) for key, item in value.items()}
+    def redact(cls, value: Any, name: str = '', *, exported: bool = False) -> Any:
+        """
+        A copy of a configuration value with anything that could be a secret masked.
+
+        Masked: values whose name suggests a secret; everything under ``export`` (those become
+        environment variables for tasks, which is where API keys live); and the credentials and
+        query string of anything that looks like a URL, whatever it is called.
+        """
         lowered = name.lower()
-        secret = any(word in lowered for word in cls.SECRET_WORDS) and lowered not in ('keep', 'monkey')
-        if secret and value not in (None, '', '<none>', '<auto>', '<not-secure>') and not isinstance(value, bool):
-            return '********'
-        if lowered == 'url' and isinstance(value, str) and '@' in value:
-            return re.sub(r'//[^@/]*@', '//********@', value)
+        if isinstance(value, dict):
+            return {key: cls.redact(item, str(key), exported=exported or lowered == 'export')
+                    for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls.redact(item, name, exported=exported) for item in value]
+        if value in cls.PLACEHOLDERS or isinstance(value, bool):
+            return value
+        if exported or (any(word in lowered for word in cls.SECRET_WORDS) and lowered not in ('keep', 'monkey')):
+            return cls.MASK
+        if isinstance(value, str) and '://' in value:
+            return cls.redact_url(value)
         return value
+
+    @classmethod
+    def redact_url(cls, text: str) -> str:
+        """A URL without its userinfo or query string, which are where credentials ride."""
+        scheme, _, rest = text.partition('://')
+        rest, question, _ = rest.partition('?')
+        authority, slash, path = rest.partition('/')
+        if '@' in rest:
+            # The password may itself contain '/', so split on the last '@' of the whole remainder.
+            credentials, _, after = rest.rpartition('@')
+            authority, slash, path = after.partition('/')
+            authority = f'{cls.MASK}@{authority}'
+        return f'{scheme}://{authority}{slash}{path}' + (f'?{cls.MASK}' if question else '')
 
     @classmethod
     def config_get(cls, key: str | None) -> tuple[Any, str | None]:
@@ -813,9 +926,7 @@ class Backend:
             except Exception:
                 source = None
         name = parts[-1] if parts else ''
-        if any(word in part.lower() for part in parts[:-1] for word in ('export',)):
-            name = 'secret'  # exported environment variables often hold credentials
-        return cls.redact(cls.plain(value), name), source
+        return cls.redact(cls.plain(value), name, exported='export' in [part.lower() for part in parts]), source
 
     @classmethod
     def plain(cls, value: Any) -> Any:

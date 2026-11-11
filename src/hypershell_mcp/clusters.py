@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -47,6 +49,9 @@ SECRET_PREFIX: Final[str] = 'HYPERSHELL_MCP_'
 """This server's own settings, which must not reach the environment of the tasks a cluster runs."""
 
 KILL_GRACE: Final[float] = 10.0
+HOST: Final[re.Pattern[str]] = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@\[\]-]{0,252}')
+NAME: Final[re.Pattern[str]] = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,119}')
+MEMORY: Final[re.Pattern[str]] = re.compile(r'\d+(\.\d+)?\s*[KMGTP]?i?B?', re.IGNORECASE)
 
 
 class ClusterError(Exception):
@@ -112,25 +117,37 @@ class ClusterOptions(BaseModel):
                 argv.append('--eager')
         if self.task_timeout:
             argv += ['-W', str(self.task_timeout)]
+        # Free text is passed as --option=value, one word, so that nothing a caller writes can be
+        # read by hs as a separate option or, for the host list, as a task file.
         if self.template:
-            argv += ['-t', self.template]
+            argv.append(f'--template={self.template}')
         if self.bundlesize:
             argv += ['-b', str(self.bundlesize)]
         if self.client_cores:
             argv += ['-C', str(self.client_cores)]
         if self.client_memory:
-            argv += ['-M', self.client_memory]
+            if not MEMORY.fullmatch(self.client_memory.strip()):
+                raise ClusterError(f"cannot read {self.client_memory!r} as memory: write e.g. '64GB'")
+            argv.append(f'--client-memory={self.client_memory.strip()}')
         if self.client_timeout:
             argv += ['-T', str(self.client_timeout)]
         if self.monitor:
             argv.append('--monitor')
         if self.zone:
-            argv += ['--zone', self.zone]
+            if self.zone.startswith('-') or not self.zone.isprintable():
+                raise ClusterError(f'invalid zone name {self.zone!r}')
+            argv.append(f'--zone={self.zone}')
         if self.launcher == 'ssh':
             if self.ssh_group:
-                argv += ['--ssh-group', self.ssh_group]
+                if not NAME.fullmatch(self.ssh_group):
+                    raise ClusterError(f'invalid ssh group name {self.ssh_group!r}')
+                argv += ['--ssh', f'--ssh-group={self.ssh_group}']
             elif self.hosts:
-                argv += ['--ssh', *self.hosts]
+                for host in self.hosts:
+                    if not HOST.fullmatch(host):
+                        raise ClusterError(f'invalid host name {host!r}')
+                # hs takes one value here: a single host, or a comma-separated list of them.
+                argv.append('--ssh=' + ','.join(self.hosts))
             else:
                 raise ClusterError("launcher 'ssh' needs hosts or ssh_group")
         elif self.launcher == 'mpi':
@@ -155,11 +172,16 @@ class ClusterManager:
     def __init__(self, root: Path) -> None:
         self.root = root
         self._children: dict[str, subprocess.Popen[bytes]] = {}
+        self._starting = threading.Lock()
 
     # ---------------------------------------------------------------------------------------------
 
     def start(self, options: ClusterOptions) -> ClusterInfo:
-        """Start a cluster, detached, and return its record."""
+        """Start a cluster, detached, and return its record. One caller at a time."""
+        with self._starting:
+            return self._start(options)
+
+    def _start(self, options: ClusterOptions) -> ClusterInfo:
         running = self.running()
         if running:
             raise ClusterError(f'cluster {running[0].id} is already running (pid {running[0].pid}). One '
@@ -171,6 +193,11 @@ class ClusterManager:
         cluster_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
         folder = self.root / cluster_id
         folder.mkdir(parents=True, exist_ok=False)
+        record = {'id': cluster_id, 'pid': 0, 'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+                  'mode': options.mode, 'workers': options.workers,
+                  'launcher': None if options.launcher == 'local' else options.launcher,
+                  'zone': options.zone, 'cwd': str(cwd),
+                  'command': 'hs ' + ' '.join(quote(word) for word in arguments)}
         environment = {name: value for name, value in os.environ.items() if not name.startswith(SECRET_PREFIX)}
         environment.setdefault('HYPERSHELL_LOGGING_COLOR', 'false')
         with open(folder / 'cluster.log', 'ab') as log:
@@ -179,11 +206,11 @@ class ClusterManager:
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=environment,
                 start_new_session=True, cwd=cwd)
         self._children[cluster_id] = process
-        record = {'id': cluster_id, 'pid': process.pid, 'started': time.strftime('%Y-%m-%d %H:%M:%S'),
-                  'mode': options.mode, 'workers': options.workers,
-                  'launcher': None if options.launcher == 'local' else options.launcher,
-                  'zone': options.zone, 'cwd': str(cwd), 'command': 'hs ' + ' '.join(quote(word) for word in arguments)}
-        (folder / 'cluster.json').write_text(json.dumps(record, indent=2))
+        record['pid'] = process.pid
+        # Written whole and then renamed into place: a reader never sees half a record.
+        partial = folder / 'cluster.json.partial'
+        partial.write_text(json.dumps(record, indent=2))
+        os.replace(partial, folder / 'cluster.json')
         time.sleep(0.4)  # long enough for a bad option to end the process
         info = self.get(cluster_id, log_lines=20)
         if info.state == 'exited' and info.exit_code not in (0, None):
@@ -195,7 +222,11 @@ class ClusterManager:
         folder = self.root / cluster_id
         if '/' in cluster_id or '..' in cluster_id or not (folder / 'cluster.json').is_file():
             raise ClusterError(f'no cluster {cluster_id!r}; list_clusters shows the ones this server started')
-        record: dict[str, Any] = json.loads((folder / 'cluster.json').read_text())
+        try:
+            record: dict[str, Any] = json.loads((folder / 'cluster.json').read_text())
+            record['pid'] = int(record['pid'])
+        except (OSError, ValueError, KeyError, TypeError):
+            raise ClusterError(f'the record of cluster {cluster_id!r} is unreadable') from None
         alive = self._alive(cluster_id, record['pid'], folder)
         exit_code = stopped = None
         if not alive:
@@ -222,7 +253,15 @@ class ClusterManager:
             return []
         names = sorted((entry.name for entry in self.root.iterdir() if (entry / 'cluster.json').is_file()),
                        reverse=True)
-        return [self.get(name, log_lines=log_lines) for name in names[:limit]]
+        found = []
+        for name in names:
+            try:
+                found.append(self.get(name, log_lines=log_lines))
+            except ClusterError:
+                continue  # one damaged record must not hide the rest
+            if len(found) == limit:
+                break
+        return found
 
     def running(self) -> list[ClusterInfo]:
         return [info for info in self.list(limit=50) if info.state == 'running']

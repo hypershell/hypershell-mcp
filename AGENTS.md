@@ -18,6 +18,7 @@ src/hypershell_mcp/
   clusters.py    Starting, finding and stopping detached `hs cluster` processes
   outputs.py     Bounded, confined reading of captured task output
   diagnose.py    Grouping failures by exit status and masked stderr signature
+  templates.py   Text-only submit templates (the safe subset of HyperShell's)
   models.py      Pydantic shapes for tool arguments and results
   guard.py       Lets expected errors through the server's error masking
   app.py         Shared state for tools: settings, backend, clusters, the caller, the audit log
@@ -44,9 +45,12 @@ uv run hypershell-mcp check   # what would be served
    and `--disable` act on the tag; a component without one would be open to any valid token.
    `tests/test_tasks.py` and `tests/test_http.py` pin the full sets.
 2. **Nothing a caller below the run tier supplies may execute or choose a file.** Submit-time
-   templates refuse `{% %}` and `{= =}`. Output paths come from the database and are confined by
-   `outputs.inside`. `tag_tasks` changes tags only. If you add a parameter that reaches a
-   subprocess, a path, SQL text or a JSON path, validate it and add a test that tries to abuse it.
+   templates go through `templates.py`, never HyperShell's engine (which runs shell and Python).
+   Output paths come from the database and are confined by `outputs.inside`. `tag_tasks` changes
+   tags only, and never `submitter`. `set_config` writes an allow-list. Caller regexes run under a
+   deadline (`regex`, not `re`). If you add a parameter that reaches a subprocess, a path, SQL
+   text, a JSON path or a regex, validate it and add a test to `tests/test_security.py` that tries
+   to abuse it. Deny-lists lose: the first version of the template check was bypassed by a space.
 3. **All HyperShell access goes through `Backend.call`.** One thread, one session, rollback on
    error, `Session.remove()` after. Never touch `hypershell.data` from a tool directly, and never
    import `hypershell` at module top level outside `backend.lib()`: HyperShell reads its

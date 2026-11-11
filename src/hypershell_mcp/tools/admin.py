@@ -27,8 +27,26 @@ from hypershell_mcp.tools import tool
 
 __all__ = ['register']
 
-SAFE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.+-]{0,100}$')
-CONFIG_KEY = re.compile(r'^[a-z][a-z0-9_]*(\.[A-Za-z0-9_]+)+$')
+SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.+-]{0,100}')
+
+SETTABLE = frozenset({
+    'task.timeout', 'task.signalwait', 'task.cores', 'task.memory',
+    'submit.bundlesize', 'submit.bundlewait',
+    'server.attempts', 'server.eager', 'server.poll', 'server.evict', 'server.bundlesize',
+    'server.bundlemax', 'server.queuesize',
+    'client.bundlesize', 'client.bundlewait', 'client.heartrate', 'client.timeout', 'client.cores',
+    'client.memory', 'client.ratelimit',
+    'autoscale.policy', 'autoscale.factor', 'autoscale.period', 'autoscale.size.init',
+    'autoscale.size.min', 'autoscale.size.max',
+    'logging.level', 'console.theme',
+})
+"""
+The configuration values this server will write: how tasks are scheduled, bundled, limited and
+retried. Everything else decides *what runs or where data lives* (the database, exported
+environment, launchers, SSH, keys, working directory, and any ``_eval`` or ``_env`` key, which
+HyperShell resolves by running a command or reading the environment). Those would let the admin
+tier execute commands, so they are left to someone editing the file.
+"""
 
 
 def register(mcp: FastMCP, app: App) -> None:
@@ -79,7 +97,7 @@ def register(mcp: FastMCP, app: App) -> None:
         so this is safe at any time, including before a risky bulk change.
         """
         name = name or f"backup-{time.strftime('%Y%m%d-%H%M%S')}.db"
-        if not SAFE_NAME.match(name):
+        if not SAFE_NAME.fullmatch(name):
             raise BackendError('The backup name must be a plain file name: letters, digits and _ . + -')
         folder = app.state_dir / 'backups'
         target = folder / name
@@ -103,24 +121,24 @@ def register(mcp: FastMCP, app: App) -> None:
     @tool(mcp, app, Tier.ADMIN, 'Set configuration', idempotent=True)
     async def set_config(
             key: Annotated[str, Field(
-                description="Dotted name of the value, e.g. 'task.timeout', 'server.attempts', "
-                            "'client.heartrate'.")],
+                description='Dotted name of the value. Settable: ' + ', '.join(sorted(SETTABLE)) + '.')],
             value: Annotated[str | int | float | bool, Field(description='The new value.')],
             scope: Annotated[Literal['user', 'local', 'system'] | None, Field(
                 description="Which configuration file to write: 'local' (this site's own file), 'user' "
                             "(this user's HyperShell config) or 'system'. Default: local when the site "
                             'has its own file, otherwise user.')] = None) -> AdminResult:
         """
-        Write one value to a HyperShell configuration file. It applies to HyperShell processes
-        started afterwards, such as the next cluster; this server and anything already running
-        keep the values they loaded. This server's own settings (the mcp section) cannot be
-        changed through it. HyperShell keeps a dated copy of the file it replaces.
+        Write one scheduling or limit setting to a HyperShell configuration file: timeouts,
+        bundle sizes, retries, polling, autoscaling sizes, log level. It applies to HyperShell
+        processes started afterwards, such as the next cluster; this server and anything already
+        running keep the values they loaded. Settings that decide what runs or where data lives
+        (the database, exported environment, launchers, keys, this server's own mcp section) are
+        not settable here. HyperShell keeps a dated copy of the file it replaces.
         """
-        if not CONFIG_KEY.match(key):
-            raise BackendError(f"{key!r} is not a configuration name; write SECTION.NAME, e.g. 'task.timeout'")
-        if key.split('.')[0] == 'mcp':
-            raise BackendError("The mcp section holds this server's own security settings and is not "
-                               'changeable through the server. Edit the configuration file directly.')
+        if key not in SETTABLE:
+            raise BackendError(f'{key!r} is not settable through this server. Settable: '
+                               f"{', '.join(sorted(SETTABLE))}. Other settings decide what runs or where "
+                               'data lives; edit the configuration file to change them.')
         text = str(value).lower() if isinstance(value, bool) else str(value)
         if scope is None:
             _, local = await app.hs('config', '--local', timeout=60)

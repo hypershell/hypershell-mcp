@@ -92,7 +92,7 @@ async def wait_until_done(app: App, ctx: Context, selector: TaskSelector | None,
             break
         if counts.running == 0 and elapsed >= grace and not await asyncio.to_thread(app.clusters.running):
             queue = await app.queue()
-            if queue.clients_connected == 0 or when_unserved is not None:
+            if queue.clients_connected == 0:
                 if when_unserved is None:
                     note = (f'{counts.pending} tasks are pending and nothing is running them: no cluster '
                             'started by this server is alive and no client is connected. Start one with '
