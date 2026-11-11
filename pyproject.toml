@@ -1,20 +1,18 @@
 [project]
 name = "hypershell-mcp"
-version = "0.1.0"
-description = "HyperShell MCP Server: Enables Agentic-development with HyperShell"
+version = "0.2.0"
+description = "MCP server for HyperShell: many-task computing for agents"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Geoffrey Lentner" }]
 dependencies = [
-    "hypershell>=2.7.0",
-    "fastmcp>=2.0.0,<3",
+    "hypershell>=2.9.0a6",
+    "fastmcp>=4.1.8,<4.2",
 ]
 
-[project.optional-dependencies]
-postgres = ["psycopg2>=2.9.9"]
-uuid7 = ["uuid-utils>=0.10.0"]
-
 [project.scripts]
-hypershell-mcp = "hypershell_mcp:main"
+hypershell-mcp = "hypershell_mcp.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -25,19 +23,11 @@ packages = ["src/hypershell_mcp"]
 
 [tool.pytest.ini_options]
 addopts = ["--strict-markers"]
-markers = [
-    "unit",
-    "integration",
-]
+asyncio_mode = "auto"
+markers = ["unit", "integration"]
 
 [dependency-groups]
 dev = [
-    "psycopg2>=2.9.9",
-    "uuid-utils>=0.10.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
-    "python-dotenv>=1.0.0",
 ]
-
-[tool.uv.sources]
-hypershell = { path = "../hypershell", editable = true }
