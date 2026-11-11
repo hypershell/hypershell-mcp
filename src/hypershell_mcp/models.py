@@ -38,36 +38,28 @@ class TaskSelector(Model):
 
     An empty selector matches every task in the database, which is what listing and counting
     want; tools that change tasks refuse an empty selector unless told `everything=true`.
+
+    The descriptions are short on purpose: this schema is repeated in every tool that takes a
+    selector, and all of it is read by the model on every connection. The guide resource has the
+    long form.
     """
 
-    ids: Annotated[list[str] | None, Field(
-        description='Exact task ids (UUIDs).')] = None
-    batch: Annotated[str | None, Field(
-        description='A batch id returned by submit_tasks or run_tasks. Shorthand for the tag '
-                    'batch:<id>.')] = None
-    status: Annotated[list[State] | None, Field(
-        description='Any of these states. pending: not yet handed to a client. running: handed '
-                    'out and not finished. succeeded: exit status 0. failed: finished with a '
-                    'non-zero exit status, killed by a signal, or timed out. cancelled: cancelled '
-                    'before it finished. completed: any finished state. remaining: pending or '
-                    'running.')] = None
-    tags: Annotated[dict[str, TagValue] | None, Field(
-        description='Tags the task must carry. A value of null means the tag only has to be '
-                    'present; otherwise the value must be equal.')] = None
-    group: Annotated[int | None, Field(
-        description='Task group. Groups run in ascending order, each finishing before the next '
-                    'starts.')] = None
-    zone: Annotated[str | None, Field(
-        description="Zone name. 'default' selects tasks that were submitted without a zone.")] = None
-    where: Annotated[list[str] | None, Field(
-        description="Extra conditions as 'FIELD OP VALUE', all of which must hold. OP is one of "
-                    "== != > >= < <= ~ (regular expression) !~. VALUE null tests for absence. "
-                    "Examples: 'exit_status == 137', 'duration > 600', 'args ~ \\.fastq$', "
-                    "'client_host == node042', 'submit_time >= 2026-11-01'.")] = None
+    ids: Annotated[list[str], Field(description='Exact task ids.')] = []
+    batch: Annotated[str | None, Field(description='Batch id from submit_tasks or run_tasks.')] = None
+    status: Annotated[list[State], Field(
+        description='Any of these states. failed excludes cancelled; completed = any finished state; '
+                    'remaining = pending or running.')] = []
+    tags: Annotated[dict[str, TagValue], Field(
+        description='Tags to match: {"key": value}, or {"key": null} for "has this tag".')] = {}
+    group: Annotated[int | None, Field(description='Task group.')] = None
+    zone: Annotated[str | None, Field(description="Zone name; 'default' means no zone.")] = None
+    where: Annotated[list[str], Field(
+        description="Conditions 'FIELD OP VALUE', OP one of == != > >= < <= ~ !~ (regex); VALUE null "
+                    "tests absence. E.g. 'exit_status == 137', 'duration > 600', 'args ~ \\.bam$', "
+                    "'client_host == node042'.")] = []
     superseded: Annotated[bool | None, Field(
-        description='false leaves out failed attempts that an automatic retry already replaced, '
-                    'so each task is counted once by its latest attempt; true selects only those '
-                    'replaced attempts. Omit to include both.')] = None
+        description='false: leave out failed attempts that a retry replaced, so each task counts '
+                    'once. true: only those.')] = None
 
     def is_empty(self) -> bool:
         return not any((self.ids, self.batch, self.status, self.tags, self.group is not None,

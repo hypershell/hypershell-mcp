@@ -60,52 +60,47 @@ class ClusterOptions(BaseModel):
 
     workers: Annotated[int, Field(
         ge=0, le=4096,
-        description='Tasks each client runs at once (0 = one per core). Default 4.')] = 4
+        description='Tasks each client runs at once (0 = one per core).')] = 4
     mode: Annotated[Literal['drain', 'forever'], Field(
-        description="'drain' runs until no tasks remain, then exits. 'forever' stays up waiting "
-                    'for new submissions until it is stopped.')] = 'drain'
+        description="'drain' exits when no tasks remain; 'forever' waits for new ones until stopped.")] = 'drain'
     max_retries: Annotated[int, Field(
         ge=0, le=100,
-        description='Times a failed task is retried automatically. Note that this applies to '
-                    'every failed task in the database, including old ones.')] = 0
+        description='Automatic retries per failed task (applies to every failed task in the '
+                    'database, old ones included).')] = 0
     eager: Annotated[bool, Field(description='Schedule retries before new tasks.')] = False
     task_timeout: Annotated[int | None, Field(
-        ge=1, description='Wall-time limit in seconds for every task (a task\'s own limit still '
-                          'applies when it is shorter).')] = None
+        ge=1, description='Wall-time limit per task, in seconds.')] = None
     launcher: Annotated[Literal['local', 'ssh', 'mpi', 'custom'], Field(
-        description="Where clients run. 'local': on this host. 'ssh': on the given hosts. 'mpi': "
-                    "under mpirun. 'custom': under launcher_command, e.g. 'srun --exclusive'.")] = 'local'
+        description="Where clients run: this host, 'ssh' hosts, under mpirun, or under "
+                    'launcher_command.')] = 'local'
     hosts: Annotated[list[str] | None, Field(
-        description="SSH hosts to start a client on (launcher 'ssh').")] = None
+        description="Hosts for launcher 'ssh'.")] = None
     ssh_group: Annotated[str | None, Field(
-        description="Name of a host list in the HyperShell config (ssh.nodelist), instead of hosts.")] = None
+        description='A host list named in the HyperShell config (ssh.nodelist), instead of hosts.')] = None
     launcher_command: Annotated[str | None, Field(
-        description="Command that starts each client (launcher 'custom').")] = None
+        description="Command that starts each client for launcher 'custom', e.g. 'srun --exclusive'.")] = None
     autoscaling: Annotated[Literal['fixed', 'dynamic'] | None, Field(
-        description="Scale the number of clients through the launcher: 'fixed' keeps init_size "
-                    "clients; 'dynamic' grows and shrinks with the queue between min_size and "
-                    "max_size. Needs launcher 'custom'.")] = None
+        description="Scale clients through a 'custom' launcher: 'fixed' keeps init_size; 'dynamic' "
+                    'follows the queue between min_size and max_size.')] = None
     init_size: Annotated[int | None, Field(ge=0, description='Clients at start (autoscaling).')] = None
     min_size: Annotated[int | None, Field(ge=0, description='Fewest clients (autoscaling).')] = None
     max_size: Annotated[int | None, Field(ge=1, description='Most clients (autoscaling).')] = None
     zone: Annotated[str | None, Field(
-        description='Zone the clients serve. Clients without a zone run only tasks without one.')] = None
+        description='Zone the clients serve (default: tasks without a zone).')] = None
     template: Annotated[str | None, Field(
-        description="Client-side command template applied to each task's args, e.g. "
-                    "'python process.py {}'. Default '{}' runs the args as they are.")] = None
+        description="Client-side template applied to each task's args, e.g. 'python run.py {}'.")] = None
     bundlesize: Annotated[int | None, Field(
-        ge=1, description='Tasks handed to a client at a time. Raise it for very short tasks.')] = None
+        ge=1, description='Tasks handed to a client at a time; raise for very short tasks.')] = None
     client_cores: Annotated[int | None, Field(
         ge=1, description='Cores a client may commit to tasks that declare cores.')] = None
     client_memory: Annotated[str | None, Field(
-        description="Memory a client may commit to tasks that declare memory, e.g. '64GB'.")] = None
+        description="Memory a client may commit, e.g. '64GB'.")] = None
     client_timeout: Annotated[int | None, Field(
-        ge=1, description='Seconds an idle client waits for work before it shuts down.')] = None
+        ge=1, description='Seconds an idle client waits before shutting down.')] = None
     monitor: Annotated[bool, Field(
-        description='Also record the cores and memory each task actually used.')] = False
+        description='Record the cores and memory each task used.')] = False
     cwd: Annotated[str | None, Field(
-        description='Directory the tasks run in (local clients). Default: where this server '
-                    'was started.')] = None
+        description="Directory tasks run in (default: this server's).")] = None
 
     def arguments(self) -> list[str]:
         """The ``hs cluster`` arguments for these options."""
