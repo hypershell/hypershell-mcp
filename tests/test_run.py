@@ -64,7 +64,7 @@ async def test_output_can_be_read_by_head_tail_and_pattern(client):
     found = await output(pattern=r'line 1?9$')
     assert found['text'] == '9: line 9\n19: line 19' and found['matches'] == 2
     assert (await output(stream='stderr'))['text'] == 'ERROR: disk 7 full\n'
-    assert 'not a valid regular expression' in (await output(pattern='('))['reason']
+    assert 'cannot be used as a pattern' in (await output(pattern='('))['reason']
     detail = data(await client.call_tool('get_task', {'task_id': task['id'], 'output_lines': 2}))
     assert detail['stdout']['text'] == 'line 199\nline 200\n' and detail['task']['command'].startswith('for i in')
     resource = await client.read_resource(f"hypershell://task/{task['id']}/stderr")
@@ -240,6 +240,19 @@ async def test_set_config_writes_the_site_file_and_protects_its_own_section(clie
     written = data(await client.call_tool('set_config', {'key': 'task.timeout', 'value': 120}))
     assert written['ok'] is True and written['path'] == str(site / 'config.toml'), written
     assert 'timeout = 120' in (site / 'config.toml').read_text()
+    # Values are typed: HyperShell reads its configuration untyped, and a log level it does not
+    # know stops every hs process on the site (this server included) from starting.
+    for key, value, reason in (('logging.level', 'bogus', 'one of'), ('task.timeout', '--', 'a whole number'),
+                               ('task.timeout', -5, 'between'), ('task.timeout', '[1,2]', 'a whole number'),
+                               ('server.eager', 'yes', 'true or false'), ('autoscale.policy', 'wild', 'one of'),
+                               ('task.memory', '64G', 'as memory'), ('task.timeout', 1.5, 'a whole number')):
+        with pytest.raises(ToolError, match=reason):
+            await client.call_tool('set_config', {'key': key, 'value': value})
+    for key, value, line in (('logging.level', 'DEBUG', 'level = "debug"'), ('server.eager', True, 'eager = true'),
+                             ('client.memory', '4GB', 'memory = 4294967296')):
+        assert data(await client.call_tool('set_config', {'key': key, 'value': value}))['ok'] is True
+        assert line in (site / 'config.toml').read_text(), (site / 'config.toml').read_text()
+    assert data(await client.call_tool('init_database', {}))['ok'] is True   # hs still starts
     (site / 'config.toml').unlink()
     for key in ('mcp.jwt.secret', 'timeout', 'database.file', 'export.PATH', 'server.auth', 'task.cwd',
                 'autoscale.launcher', 'ssh.nodelist', 'task.timeout_eval', 'database.x_eval'):

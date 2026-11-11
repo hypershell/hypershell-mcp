@@ -78,6 +78,12 @@ class Settings:
 
     limits: Limits = field(default_factory=Limits)
 
+    hosts: tuple[str, ...] = ()
+    """
+    Host names requests may be addressed to, beyond the address the server is bound to. Needed
+    behind a reverse proxy on the same machine that passes the public Host header through.
+    """
+
     @property
     def readonly(self) -> bool:
         return self.tiers == frozenset({Tier.READ})
@@ -166,6 +172,9 @@ def load_settings(section: Mapping[str, Any] | None = None, **overrides: Any) ->
     if Tier.READ not in tiers:
         raise SettingsError('the read tier cannot be disabled: every other tier builds on it')
 
+    hosts = section.get('hosts') or []
+    if isinstance(hosts, str):
+        hosts = hosts.replace(',', ' ').split()
     defaults = Limits()
     try:
         limits = replace(defaults, **{name: int(limit[name]) for name in ('rows', 'output', 'submit', 'wait')
@@ -179,6 +188,7 @@ def load_settings(section: Mapping[str, Any] | None = None, **overrides: Any) ->
     settings = Settings(transport=str(pick('transport', section, 'stdio')),
                         host=str(pick('host', section, DEFAULT_HOST)), port=port,
                         path=str(pick('path', section, DEFAULT_PATH)), auth=auth,
-                        anonymous=bool(overrides.get('anonymous')), tiers=tiers, limits=limits)
+                        anonymous=bool(overrides.get('anonymous')), tiers=tiers, limits=limits,
+                        hosts=tuple(str(name) for name in hosts))
     settings.validate()
     return settings

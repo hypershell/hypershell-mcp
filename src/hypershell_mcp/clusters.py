@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -29,12 +30,13 @@ import uuid
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from hypershell_mcp.backend import BackendError, memory_text
 from hypershell_mcp.models import ClusterInfo
 from hypershell_mcp.outputs import tail_text
 
-__all__ = ['ClusterOptions', 'ClusterManager', 'ClusterError', 'RUNNER']
+__all__ = ['ClusterOptions', 'ClusterManager', 'ClusterError', 'RUNNER', 'child_environment', 'protect']
 
 RUNNER: Final[str] = (
     'import sys\n'
@@ -48,10 +50,31 @@ RUNNER: Final[str] = (
 SECRET_PREFIX: Final[str] = 'HYPERSHELL_MCP_'
 """This server's own settings, which must not reach the environment of the tasks a cluster runs."""
 
+PROTECTED: set[str] = set()
+"""Other environment variables that hold this server's secrets (see `protect`)."""
+
+
+def protect(name: str) -> None:
+    """Keep the environment variable `name` out of every child process from now on."""
+    PROTECTED.add(name)
+
+
+def child_environment() -> dict[str, str]:
+    """
+    The environment for an ``hs`` child process: this one's, less the server's own secrets.
+
+    A cluster's environment becomes the environment of every task it runs. The server's settings
+    arrive as ``HYPERSHELL_MCP_*`` variables, and its signing secret may arrive in a variable that
+    the configuration names (``secret_env``); neither is passed on.
+    """
+    return {name: value for name, value in os.environ.items()
+            if not name.startswith(SECRET_PREFIX) and name not in PROTECTED}
+
 KILL_GRACE: Final[float] = 10.0
+RECORDED: Final[tuple[str, ...]] = ('id', 'pid', 'started', 'mode', 'workers', 'launcher', 'zone', 'cwd', 'command')
+"""The fields of a cluster record. A record written by another version may hold others; they are ignored."""
 HOST: Final[re.Pattern[str]] = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@\[\]-]{0,252}')
 NAME: Final[re.Pattern[str]] = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,119}')
-MEMORY: Final[re.Pattern[str]] = re.compile(r'\d+(\.\d+)?\s*[KMGTP]?i?B?', re.IGNORECASE)
 
 
 class ClusterError(Exception):
@@ -107,9 +130,20 @@ class ClusterOptions(BaseModel):
     cwd: Annotated[str | None, Field(
         description="Directory tasks run in (default: this server's).")] = None
 
+    @property
+    def effective_mode(self) -> str:
+        """An autoscaling cluster keeps running until stopped, whatever `mode` says: hs does the same."""
+        return 'forever' if self.autoscaling else self.mode
+
     def arguments(self) -> list[str]:
         """The ``hs cluster`` arguments for these options."""
-        argv = ['cluster', '--restart' if self.mode == 'drain' else '--forever', '--capture',
+        # Options that belong to another launcher are an error, not something to drop quietly:
+        # hosts given without launcher 'ssh' would otherwise start a local cluster instead.
+        if self.launcher != 'ssh' and (self.hosts or self.ssh_group):
+            raise ClusterError("hosts and ssh_group need launcher 'ssh'")
+        if self.launcher != 'custom' and self.launcher_command:
+            raise ClusterError("launcher_command needs launcher 'custom'")
+        argv = ['cluster', '--restart' if self.effective_mode == 'drain' else '--forever', '--capture',
                 '-N', str(self.workers), '-Q', '2']
         if self.max_retries:
             argv += ['-r', str(self.max_retries)]
@@ -126,9 +160,10 @@ class ClusterOptions(BaseModel):
         if self.client_cores:
             argv += ['-C', str(self.client_cores)]
         if self.client_memory:
-            if not MEMORY.fullmatch(self.client_memory.strip()):
-                raise ClusterError(f"cannot read {self.client_memory!r} as memory: write e.g. '64GB'")
-            argv.append(f'--client-memory={self.client_memory.strip()}')
+            try:
+                argv.append(f'--client-memory={memory_text(self.client_memory)}')
+            except BackendError as error:
+                raise ClusterError(str(error)) from None
         if self.client_timeout:
             argv += ['-T', str(self.client_timeout)]
         if self.monitor:
@@ -194,17 +229,21 @@ class ClusterManager:
         folder = self.root / cluster_id
         folder.mkdir(parents=True, exist_ok=False)
         record = {'id': cluster_id, 'pid': 0, 'started': time.strftime('%Y-%m-%d %H:%M:%S'),
-                  'mode': options.mode, 'workers': options.workers,
+                  'mode': options.effective_mode, 'workers': options.workers,
                   'launcher': None if options.launcher == 'local' else options.launcher,
                   'zone': options.zone, 'cwd': str(cwd),
                   'command': 'hs ' + ' '.join(quote(word) for word in arguments)}
-        environment = {name: value for name, value in os.environ.items() if not name.startswith(SECRET_PREFIX)}
+        environment = child_environment()
         environment.setdefault('HYPERSHELL_LOGGING_COLOR', 'false')
-        with open(folder / 'cluster.log', 'ab') as log:
-            process = subprocess.Popen(
-                [sys.executable, '-c', RUNNER, str(folder / 'exit'), *arguments],
-                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=environment,
-                start_new_session=True, cwd=cwd)
+        try:
+            with open(folder / 'cluster.log', 'ab') as log:
+                process = subprocess.Popen(
+                    [sys.executable, '-c', RUNNER, str(folder / 'exit'), *arguments],
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=environment,
+                    start_new_session=True, cwd=cwd)
+        except OSError as error:
+            shutil.rmtree(folder, ignore_errors=True)  # ours, made a moment ago, and holding nothing yet
+            raise ClusterError(f'could not start a cluster in {cwd}: {error.strerror or error}') from None
         self._children[cluster_id] = process
         record['pid'] = process.pid
         # Written whole and then renamed into place: a reader never sees half a record.
@@ -243,9 +282,12 @@ class ClusterManager:
                 log = folder / 'cluster.log'
                 if log.exists():
                     stopped = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(log.stat().st_mtime))
-        return ClusterInfo(state='running' if alive else 'exited', exit_code=exit_code, stopped=stopped,
-                           log_tail=tail_text(folder / 'cluster.log', log_lines) if log_lines else [],
-                           **record)
+        try:
+            return ClusterInfo(state='running' if alive else 'exited', exit_code=exit_code, stopped=stopped,
+                               log_tail=tail_text(folder / 'cluster.log', log_lines) if log_lines else [],
+                               **{name: record.get(name) for name in RECORDED})
+        except ValidationError:
+            raise ClusterError(f'the record of cluster {cluster_id!r} is unreadable') from None
 
     def list(self, log_lines: int = 0, limit: int = 20) -> list[ClusterInfo]:
         """Recorded clusters, newest first."""

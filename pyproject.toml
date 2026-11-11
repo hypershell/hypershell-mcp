@@ -9,7 +9,7 @@ authors = [{ name = "Geoffrey Lentner" }]
 dependencies = [
     "hypershell>=2.9.0a6",
     "fastmcp>=4.1.8,<4.2",
-    "regex>=2024.11.6",
+    "google-re2>=1.1.20251105",
 ]
 
 [project.scripts]

@@ -14,14 +14,14 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import Annotated, Literal
+from typing import Annotated, Any, Callable, Literal
 
 from fastmcp import FastMCP
 from pydantic import Field
 
 from hypershell_mcp.app import App
 from hypershell_mcp.auth import Tier
-from hypershell_mcp.backend import BackendError
+from hypershell_mcp.backend import BackendError, lib, memory_text
 from hypershell_mcp.models import AdminResult
 from hypershell_mcp.tools import tool
 
@@ -29,23 +29,68 @@ __all__ = ['register']
 
 SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.+-]{0,100}')
 
-SETTABLE = frozenset({
-    'task.timeout', 'task.signalwait', 'task.cores', 'task.memory',
-    'submit.bundlesize', 'submit.bundlewait',
-    'server.attempts', 'server.eager', 'server.poll', 'server.evict', 'server.bundlesize',
-    'server.bundlemax', 'server.queuesize',
-    'client.bundlesize', 'client.bundlewait', 'client.heartrate', 'client.timeout', 'client.cores',
-    'client.memory', 'client.ratelimit',
-    'autoscale.policy', 'autoscale.factor', 'autoscale.period', 'autoscale.size.init',
-    'autoscale.size.min', 'autoscale.size.max',
-    'logging.level', 'console.theme',
-})
+def whole(low: int = 0, high: int = 10 ** 9) -> Callable[[Any], str]:
+    """A setting that is a whole number between `low` and `high`."""
+    def check(value: Any) -> str:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value:
+            raise ValueError('a whole number')
+        if not low <= int(value) <= high:
+            raise ValueError(f'between {low} and {high}')
+        return str(int(value))
+    return check
+
+
+def number(low: float, high: float) -> Callable[[Any], str]:
+    def check(value: Any) -> str:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
+            raise ValueError(f'a number between {low} and {high}')
+        return str(value)
+    return check
+
+
+def one_of(*names: str) -> Callable[[Any], str]:
+    def check(value: Any) -> str:
+        if str(value).lower() not in names:
+            raise ValueError('one of ' + ', '.join(names))
+        return str(value).lower()
+    return check
+
+
+def truth(value: Any) -> str:
+    if not isinstance(value, bool):
+        raise ValueError('true or false')
+    return 'true' if value else 'false'
+
+
+def memory(value: Any) -> str:
+    """Bytes as a whole number, or a size such as '4GB'."""
+    if isinstance(value, str):
+        return str(lib().parse_bytes(memory_text(value)))
+    return whole()(value)
+
+
+SETTABLE: dict[str, Callable[[Any], str]] = {
+    'task.timeout': whole(), 'task.signalwait': whole(0, 3600), 'task.cores': whole(0, 4096), 'task.memory': memory,
+    'submit.bundlesize': whole(1, 100_000), 'submit.bundlewait': whole(0, 3600),
+    'server.attempts': whole(1, 100), 'server.eager': truth, 'server.poll': whole(1, 3600),
+    'server.evict': whole(1, 86_400), 'server.bundlesize': whole(1, 100_000),
+    'server.bundlemax': whole(1, 1_000_000), 'server.queuesize': whole(1, 100_000),
+    'client.bundlesize': whole(1, 100_000), 'client.bundlewait': whole(0, 3600),
+    'client.heartrate': whole(1, 3600), 'client.timeout': whole(), 'client.cores': whole(0, 4096),
+    'client.memory': memory, 'client.ratelimit': whole(),
+    'autoscale.policy': one_of('fixed', 'dynamic'), 'autoscale.factor': number(0.01, 1000),
+    'autoscale.period': whole(1, 86_400), 'autoscale.size.init': whole(0, 100_000),
+    'autoscale.size.min': whole(0, 100_000), 'autoscale.size.max': whole(1, 100_000),
+    'logging.level': one_of('trace', 'debug', 'info', 'warning', 'error', 'critical'),
+}
 """
-The configuration values this server will write: how tasks are scheduled, bundled, limited and
-retried. Everything else decides *what runs or where data lives* (the database, exported
-environment, launchers, SSH, keys, working directory, and any ``_eval`` or ``_env`` key, which
-HyperShell resolves by running a command or reading the environment). Those would let the admin
-tier execute commands, so they are left to someone editing the file.
+The configuration values this server will write, each with the check its value must pass: how
+tasks are scheduled, bundled, limited and retried. Everything else decides *what runs or where
+data lives* (the database, exported environment, launchers, SSH, keys, working directory, and any
+``_eval`` or ``_env`` key, which HyperShell resolves by running a command or reading the
+environment). Those would let the admin tier execute commands, so they are left to someone editing
+the file. Values are checked because HyperShell reads its configuration untyped: a log level it
+does not know stops every ``hs`` process on the site from starting, this server included.
 """
 
 
@@ -139,14 +184,19 @@ def register(mcp: FastMCP, app: App) -> None:
             raise BackendError(f'{key!r} is not settable through this server. Settable: '
                                f"{', '.join(sorted(SETTABLE))}. Other settings decide what runs or where "
                                'data lives; edit the configuration file to change them.')
-        text = str(value).lower() if isinstance(value, bool) else str(value)
+        try:
+            text = SETTABLE[key](value)
+        except (ValueError, BackendError) as problem:
+            raise BackendError(f'{value!r} is not a valid value for {key}: it must be {problem}') from None
         if scope is None:
             _, local = await app.hs('config', '--local', timeout=60)
             scope = 'local' if local.strip() else 'user'
         _, location = await app.hs('config', f'--{scope}', timeout=60)
         if not location.strip():
             raise BackendError(f'This site has no {scope} configuration file to write to.')
-        status, output = await app.hs('config', 'set', key, text, f'--{scope}', timeout=60)
+        # The scope comes first and the value is known not to start with '-', so hs cannot read
+        # one as the other and write a different file from the one reported.
+        status, output = await app.hs('config', 'set', f'--{scope}', key, text, timeout=60)
         return AdminResult(action='set_config', ok=status == 0,
                            detail=(output or f'{key} = {text} ({scope})')[-2000:],
                            path=location.strip() if status == 0 else None)

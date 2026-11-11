@@ -94,7 +94,7 @@ async def test_bad_submissions_are_explained(client):
         await submit(client, ['x'], memory='lots')
     with pytest.raises(ToolError, match='invalid tag key'):
         await submit(client, ['x'], tags={'bad key!': 1})
-    with pytest.raises(ToolError, match='cannot submit'):
+    with pytest.raises(ToolError, match='invalid value for tag ok'):
         await submit(client, ['x'], tags={'ok': 'bad value!'})
     assert data(await client.call_tool('status', {}))['tasks']['total'] == 0
 

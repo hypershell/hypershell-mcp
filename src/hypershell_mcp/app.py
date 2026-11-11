@@ -22,7 +22,7 @@ from fastmcp.server.dependencies import get_access_token
 
 from hypershell_mcp.auth import TIERS, Tier, scope_for
 from hypershell_mcp.backend import Backend, BackendError, hostname, lib
-from hypershell_mcp.clusters import SECRET_PREFIX, ClusterManager
+from hypershell_mcp.clusters import ClusterManager, child_environment
 from hypershell_mcp.models import AccessInfo, OutputChunk, QueueInfo
 from hypershell_mcp.outputs import read_output
 from hypershell_mcp.settings import Settings
@@ -131,8 +131,7 @@ class App:
         Used for the operations HyperShell only offers through its command line, and for the ones
         that print: a child cannot write to this server's stdout, which over stdio is the protocol.
         """
-        import os
-        environment = {name: value for name, value in os.environ.items() if not name.startswith(SECRET_PREFIX)}
+        environment = child_environment()
         environment['HYPERSHELL_LOGGING_COLOR'] = 'false'
         environment['NO_COLOR'] = '1'
 

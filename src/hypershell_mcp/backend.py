@@ -29,7 +29,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Final, Iterable, TypeVar
 
-import regex
+import re2
 
 from hypershell_mcp.templates import TemplateError, compile_template
 from hypershell_mcp.models import (STATES, DatabaseInfo, QueueInfo, StatusCounts, TagIndex,
@@ -65,8 +65,14 @@ TAG_SCAN: Final[int] = 50_000
 """Most tasks read to list the tag keys of a selection."""
 PATTERN_LIMIT: Final[int] = 300
 """Longest regular expression a caller may send."""
-MATCH_SECONDS: Final[float] = 0.25
-"""Longest one regular-expression match may run before the whole query is abandoned."""
+PATTERN_MEMORY: Final[int] = 4 * 1024 * 1024
+"""Most memory RE2 may use for one compiled pattern, in bytes; larger patterns are refused."""
+MATCH_CHARS: Final[int] = 65_536
+"""Most of a field a pattern is matched against."""
+QUERY_SECONDS: Final[float] = 30.0
+"""Longest a read may run. One slow query would otherwise hold the only database thread."""
+UNBOUNDED: Final[frozenset[str]] = frozenset({'submit', 'change'})
+"""Operations that write in several statements and must not be cut off half way."""
 CHUNK: Final[int] = 500
 """Rows per statement when changing many tasks, well under SQLite's bound-variable limit."""
 
@@ -76,34 +82,50 @@ TEMPLATE_HELP: Final[str] = (
     'whitespace-separated words')
 
 
-def check_pattern(pattern: str) -> str:
-    """Return `pattern` if it is a usable regular expression of reasonable size, else explain."""
+@functools.lru_cache(maxsize=256)
+def compile_pattern(pattern: str) -> Any:
+    """
+    Compile a caller's regular expression with RE2, or explain why it cannot be used.
+
+    Callers' patterns are matched with RE2 and nothing else. RE2 guarantees time linear in the
+    text, so no pattern can backtrack without end, and it compiles within a fixed memory budget,
+    so no pattern can be made to expand without end either. A backtracking engine with a deadline
+    was tried first and failed both ways: the deadline did not cover compilation, and a pattern
+    just under it was still paid for on every row. RE2 has no backreferences or lookaround.
+    """
     if len(pattern) > PATTERN_LIMIT:
         raise BackendError(f'the pattern is {len(pattern)} characters; the limit is {PATTERN_LIMIT}')
+    options = re2.Options()
+    options.max_mem = PATTERN_MEMORY
+    options.log_errors = False
     try:
-        regex.compile(pattern)
-    except regex.error as error:
-        raise BackendError(f'{pattern!r} is not a valid regular expression: {error}') from None
-    return pattern
+        return re2.compile(pattern, options)
+    except re2.error as error:
+        reason = error.args[0].decode() if error.args and isinstance(error.args[0], bytes) else str(error)
+        raise BackendError(f'{pattern!r} cannot be used as a pattern: {reason}. Patterns use RE2 syntax: no '
+                           'backreferences or lookaround, and repetition counts up to 1000.') from None
 
 
-def bounded_regexp(pattern: str | None, text: str | None) -> bool | None:
-    """
-    SQLite's REGEXP, with a deadline.
-
-    SQLite calls back into Python for every row, on the one thread all database work shares. A
-    pattern that backtracks without end (``(a+)+$`` against a long run of ``a``) would hold that
-    thread, and with it every caller. The `regex` module can abandon a match; `re` cannot.
-    """
+def linear_regexp(pattern: str | None, text: str | None) -> bool | None:
+    """SQLite's REGEXP: called for every row, on the one thread all database work shares."""
     if pattern is None or text is None:
         return None
-    try:
-        return regex.search(pattern, text, timeout=MATCH_SECONDS) is not None
-    except TimeoutError:
-        raise RuntimeError(SLOW_PATTERN) from None
+    return compile_pattern(pattern).search(str(text)[:MATCH_CHARS]) is not None
 
 
-SLOW_PATTERN: Final[str] = 'hypershell-mcp: regular expression abandoned as too slow'
+class Deadline:
+    """
+    The moment the statement now running must be finished by.
+
+    SQLite calls `expired` every few thousand steps of a statement and stops the statement when
+    it returns true. There is one database thread, so one deadline is all there is to track.
+    """
+
+    at: float | None = None
+
+    @classmethod
+    def expired(cls) -> bool:
+        return cls.at is not None and time.monotonic() > cls.at
 
 
 class BackendError(Exception):
@@ -136,11 +158,14 @@ def lib() -> SimpleNamespace:
                            "is not usable. Run 'hs config get database' in the same environment to see why.") from None
     if dbcore.engine.dialect.name == 'sqlite':
         @sqlalchemy.event.listens_for(dbcore.engine, 'connect')
-        def install_bounded_regexp(connection: Any, record: Any) -> None:
-            if hasattr(connection, 'create_function'):  # Turso's driver may not offer it
-                connection.create_function('regexp', 2, bounded_regexp)
+        def prepare_connection(connection: Any, record: Any) -> None:
+            if hasattr(connection, 'create_function'):  # Turso's driver may not offer these
+                connection.create_function('regexp', 2, linear_regexp)
+            if hasattr(connection, 'set_progress_handler'):
+                connection.set_progress_handler(Deadline.expired, 20_000)
 
-        # A connection opened before now has SQLAlchemy's own REGEXP, which has no deadline.
+        # A connection opened before now has SQLAlchemy's own REGEXP (Python's re, which can
+        # backtrack without end) and no deadline. Drop them so every connection is prepared.
         dbcore.engine.dispose()
     return SimpleNamespace(
         version=hypershell.__version__, sa=sqlalchemy, config=config_module.config,
@@ -217,6 +242,7 @@ class Backend:
         hs = lib()
         try:
             self._ensure_database(hs)
+            Deadline.at = None if function.__name__ in UNBOUNDED else time.monotonic() + QUERY_SECONDS
             return function(*args, **kwargs)
         except BackendError:
             hs.Session.rollback()
@@ -226,11 +252,13 @@ class Backend:
             raise NotFound(str(error) or 'not found') from None
         except Exception as error:
             hs.Session.rollback()
-            if SLOW_PATTERN in str(error) or 'user-defined function raised exception' in str(error):
-                raise BackendError('The regular expression took too long on some task and was abandoned. '
-                                   'Simplify it: overlapping alternatives such as (a|aa)+ are the usual cause.') from None
+            if Deadline.expired() and 'interrupted' in str(error).lower():
+                raise BackendError(f'The query ran for more than {QUERY_SECONDS:.0f} s and was stopped, so that '
+                                   'it would not hold up every other caller. Narrow the selector: a batch, a '
+                                   'status or a tag cuts down the tasks a condition has to examine.') from None
             raise
         finally:
+            Deadline.at = None
             hs.Session.remove()
 
     def _ensure_database(self, hs: SimpleNamespace) -> None:
@@ -358,7 +386,8 @@ class Backend:
         if operator in ('~', '!~'):
             if kind is not str:
                 raise BackendError(f'{name} is not text, so it cannot be matched with {operator}')
-            expression = column.regexp_match(check_pattern(raw))
+            compile_pattern(raw)  # refuse a bad pattern here, with a reason, not inside the query
+            expression = column.regexp_match(raw)
             return expression if operator == '~' else sa.not_(expression)
         value = cls.coerce(name, kind, raw)
         if name == 'zone' or kind is bool:
@@ -786,9 +815,15 @@ class Backend:
         names = set(tags or {})
         if len(names) > TAG_LIMIT:
             raise BackendError(f'{len(names)} tags is more than a task may carry ({TAG_LIMIT})')
-        for name in names:
+        for name, value in (tags or {}).items():
             if not TAG_KEY.fullmatch(str(name)):
                 raise BackendError(f'invalid tag key {name!r}: use letters, digits and _ . + -')
+            # Every value is checked here, including those that follow an empty one.
+            if isinstance(value, str) and value and not TAG_KEY.fullmatch(value):
+                raise BackendError(f'invalid value for tag {name}: {value[:40]!r}. Text values use letters, '
+                                   'digits and _ . + - (at most 120 characters)')
+            if value is not None and not isinstance(value, (str, int, float, bool)):
+                raise BackendError(f'the value of tag {name} must be text, a number or true/false')
         options = sorted(names & cls.OPTION_TAGS)
         if options:
             raise BackendError(f"{', '.join(options)} cannot be used as a tag name: HyperShell reads it as a "
@@ -802,10 +837,7 @@ class Backend:
     def parse_memory(text: str | None) -> int | None:
         if not text:
             return None
-        try:
-            return lib().parse_bytes(str(text))
-        except ValueError:
-            raise BackendError(f"cannot read {text!r} as memory: write e.g. '512MB' or '4GB'") from None
+        return lib().parse_bytes(memory_text(str(text)))
 
     @staticmethod
     def new_batch_id() -> str:
@@ -892,45 +924,54 @@ class Backend:
     # ---------------------------------------------------------------------------------------------
     # Configuration
 
-    SECRET_WORDS: Final[tuple[str, ...]] = ('auth', 'password', 'secret', 'token', 'key', 'passwd', 'credential')
+    SECRET_WORDS: Final[tuple[str, ...]] = ('auth', 'password', 'passwd', 'passphrase', 'pwd', 'secret', 'token',
+                                            'key', 'credential', 'signature', 'cookie', 'private')
     PLACEHOLDERS: Final[tuple[Any, ...]] = (None, '', '<none>', '<auto>', '<not-secure>')
     MASK: Final[str] = '********'
+    USERINFO: Final[re.Pattern[str]] = re.compile(r'[^\s/:@]+:[^\s@]+@')
 
     @classmethod
-    def redact(cls, value: Any, name: str = '', *, exported: bool = False) -> Any:
+    def secret_name(cls, name: str) -> bool:
+        lowered = name.lower()
+        return any(word in lowered for word in cls.SECRET_WORDS) and lowered not in ('keep', 'monkey')
+
+    @classmethod
+    def redact(cls, value: Any, name: str = '', *, hidden: bool = False) -> Any:
         """
         A copy of a configuration value with anything that could be a secret masked.
 
-        Masked: values whose name suggests a secret; everything under ``export`` (those become
-        environment variables for tasks, which is where API keys live); and the credentials and
-        query string of anything that looks like a URL, whatever it is called.
+        Masked: values whose name suggests a secret, and everything beneath a table with such a
+        name; everything under ``export`` (those become environment variables for tasks, which is
+        where API keys live); and, in any text at all, the credentials of a ``user:password@host``
+        and the query string and fragment of a URL.
         """
-        lowered = name.lower()
+        hidden = hidden or name.lower() == 'export' or cls.secret_name(name)
         if isinstance(value, dict):
-            return {key: cls.redact(item, str(key), exported=exported or lowered == 'export')
-                    for key, item in value.items()}
+            return {key: cls.redact(item, str(key), hidden=hidden) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
-            return [cls.redact(item, name, exported=exported) for item in value]
+            return [cls.redact(item, '', hidden=hidden) for item in value]
         if value in cls.PLACEHOLDERS or isinstance(value, bool):
             return value
-        if exported or (any(word in lowered for word in cls.SECRET_WORDS) and lowered not in ('keep', 'monkey')):
+        if hidden:
             return cls.MASK
-        if isinstance(value, str) and '://' in value:
-            return cls.redact_url(value)
+        if isinstance(value, str):
+            return cls.redact_text(value)
         return value
 
     @classmethod
-    def redact_url(cls, text: str) -> str:
-        """A URL without its userinfo or query string, which are where credentials ride."""
-        scheme, _, rest = text.partition('://')
-        rest, question, _ = rest.partition('?')
-        authority, slash, path = rest.partition('/')
-        if '@' in rest:
-            # The password may itself contain '/', so split on the last '@' of the whole remainder.
-            credentials, _, after = rest.rpartition('@')
-            authority, slash, path = after.partition('/')
-            authority = f'{cls.MASK}@{authority}'
-        return f'{scheme}://{authority}{slash}{path}' + (f'?{cls.MASK}' if question else '')
+    def redact_text(cls, text: str) -> str:
+        """Text without the credentials it may carry: userinfo anywhere, and a URL's query and fragment."""
+        if '://' in text:
+            for mark in ('?', '#'):
+                head, found, _ = text.partition(mark)
+                if found:
+                    text = f'{head}{mark}{cls.MASK}'
+            scheme, _, rest = text.partition('://')
+            if '@' in rest:
+                # A password may contain '/', so everything before the last '@' is credentials.
+                text = f"{scheme}://{cls.MASK}@{rest.rpartition('@')[2]}"
+            return text
+        return cls.USERINFO.sub(f'{cls.MASK}@', text)
 
     @classmethod
     def config_get(cls, key: str | None) -> tuple[Any, str | None]:
@@ -949,7 +990,8 @@ class Backend:
             except Exception:
                 source = None
         name = parts[-1] if parts else ''
-        return cls.redact(cls.plain(value), name, exported='export' in [part.lower() for part in parts]), source
+        beneath = any(part.lower() == 'export' or cls.secret_name(part) for part in parts[:-1])
+        return cls.redact(cls.plain(value), name, hidden=beneath), source
 
     @classmethod
     def plain(cls, value: Any) -> Any:
@@ -957,6 +999,23 @@ class Backend:
         if isinstance(value, dict):
             return {str(key): cls.plain(item) for key, item in value.items()}
         return value
+
+
+MEMORY: Final[re.Pattern[str]] = re.compile(r'(\d+)\s*(B|KB|MB|GB|TB)', re.IGNORECASE)
+
+
+def memory_text(text: str) -> str:
+    """
+    A memory size in the one form this server accepts: a whole number and a unit.
+
+    Only an integer followed by B, KB, MB, GB or TB is accepted, so that a size always means what
+    it appears to.
+    """
+    found = MEMORY.fullmatch(text.strip())
+    if not found:
+        raise BackendError(f"cannot read {text!r} as memory: write a whole number and a unit, e.g. '512MB' "
+                           "or '4GB' (units B, KB, MB, GB, TB)")
+    return f'{found.group(1)}{found.group(2).upper()}'
 
 
 def hostname() -> str:

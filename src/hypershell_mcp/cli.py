@@ -59,10 +59,13 @@ def configured() -> dict[str, Any]:
     found = dict(section)
     jwt = section.get('jwt')
     if jwt:
+        from hypershell_mcp.clusters import protect
         resolved = {}
         for name in jwt:
             base = name.rsplit('_', 1)[0] if name.endswith(('_env', '_eval')) else name
             resolved[base] = getattr(jwt, base)
+            if name.endswith('_env'):
+                protect(str(jwt[name]))  # the variable holds a secret: tasks must not inherit it
         found['jwt'] = resolved
     return found
 
@@ -194,7 +197,7 @@ class ServeApp(Application):
         # 'auto' checks the Host and Origin headers whenever the server is bound to loopback, which
         # is what stops a web page from reaching it through DNS rebinding.
         server.run('http', host=settings.host, port=settings.port, path=settings.path, show_banner=False,
-                   host_origin_protection='auto')
+                   host_origin_protection='auto', allowed_hosts=list(settings.hosts) or None)
 
     @classmethod
     def main(cls, argv: list[str] | None = None, **kwargs: Any) -> int:
