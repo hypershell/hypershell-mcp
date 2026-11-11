@@ -23,7 +23,7 @@ from fastmcp.server.dependencies import get_access_token
 from hypershell_mcp.auth import TIERS, Tier, scope_for
 from hypershell_mcp.backend import Backend, BackendError, hostname, lib
 from hypershell_mcp.clusters import SECRET_PREFIX, ClusterManager
-from hypershell_mcp.models import AccessInfo, OutputChunk
+from hypershell_mcp.models import AccessInfo, OutputChunk, QueueInfo
 from hypershell_mcp.outputs import read_output
 from hypershell_mcp.settings import Settings
 
@@ -108,6 +108,11 @@ class App:
 
     # ---------------------------------------------------------------------------------------------
     # Things more than one tool does
+
+    async def queue(self) -> QueueInfo:
+        """The state of the queue, discounting clients left behind by this server's last cluster."""
+        stale_before = await asyncio.to_thread(self.clusters.last_exit)
+        return await self.backend.call(self.backend.queue, stale_before)
 
     async def task_output(self, task_id: str, stream: str, *, mode: str = 'tail', lines: int = 100,
                           pattern: str | None = None, max_bytes: int | None = None) -> OutputChunk:

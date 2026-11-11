@@ -232,6 +232,23 @@ class ClusterManager:
     def running(self) -> list[ClusterInfo]:
         return [info for info in self.list(limit=50) if info.state == 'running']
 
+    def last_exit(self) -> float | None:
+        """
+        When the most recent cluster ended, as a timestamp; None if there is none or it is running.
+
+        Whatever was connected to that cluster's server before then has no server now. A cluster
+        that is killed cannot record its clients as disconnected or its tasks as stopped, so this
+        is how the rest of the server knows to discount them.
+        """
+        latest = self.list(limit=1)
+        if not latest or latest[0].state == 'running':
+            return None
+        folder = self.root / latest[0].id
+        for name in ('exit', 'cluster.log', 'cluster.json'):
+            if (folder / name).exists():
+                return (folder / name).stat().st_mtime
+        return None
+
     def log(self, cluster_id: str, lines: int) -> list[str]:
         self.get(cluster_id)
         return tail_text(self.root / cluster_id / 'cluster.log', lines, max_bytes=262_144)

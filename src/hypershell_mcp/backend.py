@@ -195,7 +195,8 @@ class Backend:
         if file and provider in ('sqlite', 'turso'):
             path = Path(str(file))
             size = path.stat().st_size if path.exists() else None
-            partitions = len([p for p in path.parent.glob(f'{path.name}.*') if p.suffix[1:].isdigit()])
+            # HyperShell rotates main.db into main.1, main.2, ... beside it
+            partitions = len([p for p in path.parent.glob(f'{path.stem}.*') if p.suffix[1:].isdigit()])
             return DatabaseInfo(provider=provider, location=str(path), size_bytes=size, partitions=partitions)
         host, name = database.get('host', 'localhost'), database.get('database', '')
         return DatabaseInfo(provider=provider, location=f'{host}/{name}'.rstrip('/'))
@@ -504,7 +505,33 @@ class Backend:
         return TaskSummary(total=total, group_by=group_by, rows=rows, truncated=len(records) > limit)
 
     @classmethod
-    def queue(cls) -> QueueInfo:
+    def clients_connected(cls, stale_before: float | None = None) -> int:
+        """
+        Clients the most recent server records as connected.
+
+        A server that is killed never marks its clients disconnected, so the record outlives them.
+        When the caller knows the server ended at `stale_before` (a timestamp), clients that
+        connected before then have no server and are not counted.
+        """
+        hs = lib()
+        Client = hs.Client
+        try:
+            if stale_before is None:
+                return hs.Client.count_connected()
+            server = hs.Task.latest_server()
+            if server is None:
+                return 0
+            rows = (hs.Session.query(Client.connected_at)
+                    .filter(Client.server_id == server, Client.disconnected_at.is_(None))
+                    .filter(hs.sa.or_(Client.relay.is_(None), Client.relay != Client.id)).all())
+            return sum(1 for (connected,) in rows if connected is not None and connected.timestamp() > stale_before)
+        except Exception as error:  # an older database without the client table's newer columns
+            log.debug('Could not count connected clients: %s', error)
+            hs.Session.rollback()
+            return 0
+
+    @classmethod
+    def queue(cls, stale_before: float | None = None) -> QueueInfo:
         """What is left to run, where, and how fast it is going."""
         hs = lib()
         Task, func = hs.Task, hs.sa.func
@@ -522,10 +549,7 @@ class Backend:
                 eta = sum(groups.values()) / rate
         except (ZeroDivisionError, TypeError):
             pass  # no interval to measure yet: every finished task shares one timestamp
-        try:
-            connected = hs.Client.count_connected()
-        except Exception:  # an older database without the client table's newer columns
-            connected = 0
+        connected = cls.clients_connected(stale_before)
         return QueueInfo(current_group=min(groups) if groups else None,
                          groups_remaining={str(group): number for group, number in groups.items()},
                          zones_remaining=by_zone, clients_connected=connected,

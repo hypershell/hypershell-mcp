@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import asynccontextmanager
 from importlib import resources as package_files
-from typing import Any, AsyncIterator
+from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -26,6 +25,7 @@ from hypershell_mcp.app import App
 from hypershell_mcp.auth import TIERS, Tier, build_authorization, build_verifier
 from hypershell_mcp.backend import BackendError, lib
 from hypershell_mcp.clusters import ClusterError
+from hypershell_mcp.guard import guard
 from hypershell_mcp.models import TaskSelector
 from hypershell_mcp.settings import Settings
 from hypershell_mcp.tools import register_all
@@ -56,8 +56,8 @@ HELP_COMMANDS = ('cluster', 'server', 'client', 'relay', 'submit', 'list', 'info
 
 class Gate(Middleware):
     """
-    Wraps every tool call: turns expected failures into messages for the caller, logs unexpected
-    ones for the operator, and records each call that could change something in the audit log.
+    Wraps every tool call to record, in the audit log, each one that could change something:
+    who called what, with which arguments, and how it ended (denied calls included).
     """
 
     def __init__(self, app: App) -> None:
@@ -71,14 +71,8 @@ class Gate(Middleware):
         error: str | None = None
         try:
             return await call_next(context)
-        except (BackendError, ClusterError) as failure:
-            error = str(failure)
-            raise ToolError(error) from None
         except Exception as failure:
-            error = f'{type(failure).__name__}: {failure}'
-            if not isinstance(failure, ToolError) and type(failure).__name__ not in (
-                    'ValidationError', 'AuthorizationError', 'InsufficientScopeError', 'NotFoundError'):
-                log.exception('Tool %s failed', name)
+            error = str(failure) if isinstance(failure, ToolError) else f'{type(failure).__name__}: {failure}'
             raise
         finally:
             if tier is not None and tier is not Tier.READ:
@@ -97,13 +91,6 @@ def build_server(settings: Settings, app: App | None = None) -> FastMCP:
     app = app or App(settings=settings)
     secured = settings.auth.enabled
 
-    @asynccontextmanager
-    async def lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
-        try:
-            yield {}
-        finally:
-            app.backend.close()
-
     mcp = FastMCP(
         name='HyperShell',
         instructions=INSTRUCTIONS,
@@ -112,7 +99,6 @@ def build_server(settings: Settings, app: App | None = None) -> FastMCP:
         icons=[Icon(src='https://hypershell.readthedocs.io/_static/logo-dark-mode.png', mime_type='image/png')],
         auth=build_verifier(settings.auth) if secured else None,
         middleware=[Gate(app), *([build_authorization()] if secured else [])],
-        lifespan=lifespan,
         mask_error_details=True,
         on_duplicate='error',
     )
@@ -139,62 +125,66 @@ def register_resources(mcp: FastMCP, app: App) -> None:
     backend = app.backend
     read = {Tier.READ.value}
 
-    @mcp.resource('hypershell://guide', name='guide', title='HyperShell guide', mime_type='text/markdown', tags=read,
+    def resource(uri: str, **options: Any) -> Any:
+        """Register a read-tier resource whose expected failures reach the caller as written."""
+        def decorate(function: Any) -> Any:
+            mcp.resource(uri, tags=read, **options)(guard(function, resource=True))
+            return function
+        return decorate
+
+    @resource('hypershell://guide', name='guide', title='HyperShell guide', mime_type='text/markdown',
                   description='How to work with HyperShell through this server: the workflow, selectors, '
                               'templates, tags, groups, zones and exit statuses.')
     def guide() -> str:
         return package_files.files('hypershell_mcp').joinpath('guide.md').read_text()
 
-    @mcp.resource('hypershell://status', name='status', title='Site status', mime_type='application/json',
-                  tags=read, description='Task counts, the queue, running clusters and your access, as JSON.')
+    @resource('hypershell://status', name='status', title='Site status', mime_type='application/json',
+              description='Task counts, the queue, running clusters and your access, as JSON.')
     async def status() -> dict[str, Any]:
         return (await site_status(app, None)).model_dump()
 
-    @mcp.resource('hypershell://config', name='config', title='Configuration', mime_type='application/json',
-                  tags=read, description='The effective HyperShell configuration with secrets masked.')
+    @resource('hypershell://config', name='config', title='Configuration', mime_type='application/json',
+              description='The effective HyperShell configuration with secrets masked.')
     async def config() -> dict[str, Any]:
         value, _ = await backend.call(backend.config_get, None)
         return value
 
-    @mcp.resource('hypershell://help/{command}', name='help', title='hs command help', mime_type='text/plain',
-                  tags=read, description="The hs command line's own help for one command: " +
+    @resource('hypershell://help/{command}', name='help', title='hs command help', mime_type='text/plain',
+              description="The hs command line's own help for one command: " +
                                          ', '.join(HELP_COMMANDS) + '.')
     async def command_help(command: str) -> str:
         if command not in HELP_COMMANDS:
-            raise ValueError(f"no help for {command!r}; commands are {', '.join(HELP_COMMANDS)}")
+            raise BackendError(f"no help for {command!r}; commands are {', '.join(HELP_COMMANDS)}")
         _, text = await app.hs(command, '--help', timeout=30)
         return text
 
-    @mcp.resource('hypershell://task/{task_id}', name='task', title='Task', mime_type='application/json', tags=read,
-                  description='Everything recorded about one task.')
+    @resource('hypershell://task/{task_id}', name='task', title='Task', mime_type='application/json',
+              description='Everything recorded about one task.')
     async def task(task_id: str) -> dict[str, Any]:
         record, attempts = await backend.call(backend.get, task_id)
         return {'task': record, 'attempts': attempts}
 
-    @mcp.resource('hypershell://task/{task_id}/{stream}', name='task-output', title='Task output',
-                  mime_type='text/plain', tags=read,
-                  description="The end of a task's captured output; stream is stdout or stderr.")
+    @resource('hypershell://task/{task_id}/{stream}', name='task-output', title='Task output',
+                  mime_type='text/plain',
+              description="The end of a task's captured output; stream is stdout or stderr.")
     async def task_output(task_id: str, stream: str) -> str:
         if stream not in ('stdout', 'stderr'):
-            raise ValueError("stream must be 'stdout' or 'stderr'")
+            raise BackendError("stream must be 'stdout' or 'stderr'")
         chunk = await app.task_output(task_id, stream, lines=1000)
         return chunk.text if chunk.available else f'[{chunk.reason}]'
 
-    @mcp.resource('hypershell://batch/{batch}', name='batch', title='Batch summary', mime_type='application/json',
-                  tags=read, description='Counts by state and exit status for one batch.')
+    @resource('hypershell://batch/{batch}', name='batch', title='Batch summary', mime_type='application/json',
+              description='Counts by state and exit status for one batch.')
     async def batch(batch: str) -> dict[str, Any]:
         selector = TaskSelector(batch=batch)
         counts = await backend.call(backend.count, selector)
         summary = await backend.call(backend.summarize, selector, ['status', 'exit_status'], 50)
         return {'batch': batch, 'counts': counts.model_dump(), 'by_exit_status': summary.model_dump()['rows']}
 
-    @mcp.resource('hypershell://cluster/{cluster_id}/log', name='cluster-log', title='Cluster log',
-                  mime_type='text/plain', tags=read, description='The end of the log of a cluster this server started.')
+    @resource('hypershell://cluster/{cluster_id}/log', name='cluster-log', title='Cluster log',
+                  mime_type='text/plain', description='The end of the log of a cluster this server started.')
     def cluster_log(cluster_id: str) -> str:
-        try:
-            return '\n'.join(app.clusters.log(cluster_id, 500))
-        except ClusterError as error:
-            raise ValueError(str(error)) from None
+        return '\n'.join(app.clusters.log(cluster_id, 500))
 
 
 def register_prompts(mcp: FastMCP) -> None:

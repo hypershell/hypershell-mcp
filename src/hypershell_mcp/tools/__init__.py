@@ -18,6 +18,7 @@ from mcp_types import ToolAnnotations
 
 from hypershell_mcp.app import App
 from hypershell_mcp.auth import Tier
+from hypershell_mcp.guard import guard
 
 __all__ = ['tool', 'register_all']
 
@@ -38,7 +39,8 @@ def tool(mcp: FastMCP, app: App, tier: Tier, title: str, *, destructive: bool = 
 
     def decorate(function: F) -> F:
         app.tool_tiers[options.get('name') or function.__name__] = tier
-        return mcp.tool(title=title, tags={tier.value}, annotations=hints, **options)(function)
+        mcp.tool(title=title, tags={tier.value}, annotations=hints, **options)(guard(function))
+        return function
 
     return decorate
 

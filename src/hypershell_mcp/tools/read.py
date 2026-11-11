@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Awaitable, Callable, Literal
 
 from fastmcp import Context, FastMCP
 from pydantic import Field
@@ -32,22 +32,25 @@ async def site_status(app: App, transport: str | None) -> SiteStatus:
     """Everything `status` reports, also served as the ``hypershell://status`` resource."""
     backend = app.backend
     counts = await backend.call(backend.count, None)
-    queue = await backend.call(backend.queue)
+    queue = await app.queue()
     running = await asyncio.to_thread(app.clusters.running)
     access = app.access(transport)
 
     hints: list[str] = []
+
+    def tasks(number: int) -> str:
+        return f'{number} task' if number == 1 else f'{number} tasks'
     serving = bool(running) or queue.clients_connected > 0
     if counts.total == 0:
         hints.append('The database has no tasks. submit_tasks adds some; run_tasks submits and runs them.')
     if counts.pending and not serving:
-        hints.append(f'{counts.pending} tasks are pending and nothing is running them. start_cluster runs '
+        hints.append(f'{tasks(counts.pending)} pending and nothing is running them. start_cluster runs '
                      'them here or through a launcher; otherwise they wait for a cluster started elsewhere.')
     if counts.running and not serving:
-        hints.append(f'{counts.running} tasks are marked running but no client is connected: they were '
-                     'probably interrupted. The next cluster to start re-queues them.')
+        hints.append(f'{tasks(counts.running)} marked running but no client is connected: probably '
+                     'interrupted. The next cluster to start re-queues them.')
     if counts.failed:
-        hints.append(f'{counts.failed} tasks failed. diagnose_failures groups them by cause.')
+        hints.append(f'{tasks(counts.failed)} failed. diagnose_failures groups them by cause.')
     if 'default' not in queue.zones_remaining and queue.zones_remaining and running and not running[0].zone:
         hints.append('The remaining tasks are all in named zones, which a cluster without a zone does not serve.')
     return SiteStatus(hypershell_version=lib().version, server_version=hypershell_mcp.__version__,
@@ -55,17 +58,23 @@ async def site_status(app: App, transport: str | None) -> SiteStatus:
                       clusters=running, access=access, hints=hints)
 
 
+Unserved = Callable[[StatusCounts], Awaitable[str | None]]
+
+
 async def wait_until_done(app: App, ctx: Context, selector: TaskSelector | None, timeout: float,
-                          *, watch_cluster: bool = True) -> WaitResult:
+                          *, when_unserved: Unserved | None = None) -> WaitResult:
     """
     Poll until every matching task has finished, the time is up, or nothing could finish them.
 
-    Progress is reported to the client as tasks complete. The wait gives up early, saying so, when
-    tasks are pending but no cluster or client exists to run them: blocking then would only hide
-    the real state from the caller.
+    Progress is reported to the client as tasks complete. Tasks are "unserved" when some remain,
+    none is running, and neither a cluster of this server's nor any connected client exists to run
+    them. By default the wait then ends early and says so, since blocking would only hide the real
+    state from the caller. A caller that can do something about it passes `when_unserved`, which
+    is awaited with the current counts and returns None to keep waiting or a note to stop with.
     """
     backend = app.backend
     started = time.monotonic()
+    grace = 3.0 if when_unserved is None else 0.0
     interval, note = 0.5, None
     while True:
         counts: StatusCounts = await backend.call(backend.count, selector)
@@ -81,12 +90,18 @@ async def wait_until_done(app: App, ctx: Context, selector: TaskSelector | None,
         if elapsed >= timeout:
             note = f'Timed out after {timeout:.0f} s with {counts.remaining} tasks unfinished. Call again to keep waiting.'
             break
-        if watch_cluster and counts.running == 0 and elapsed >= 3:
-            queue = await backend.call(backend.queue)
-            if not await asyncio.to_thread(app.clusters.running) and queue.clients_connected == 0:
-                note = (f'{counts.pending} tasks are pending and nothing is running them: no cluster started '
-                        'by this server is alive and no client is connected. Start one with start_cluster.')
-                break
+        if counts.running == 0 and elapsed >= grace and not await asyncio.to_thread(app.clusters.running):
+            queue = await app.queue()
+            if queue.clients_connected == 0 or when_unserved is not None:
+                if when_unserved is None:
+                    note = (f'{counts.pending} tasks are pending and nothing is running them: no cluster '
+                            'started by this server is alive and no client is connected. Start one with '
+                            'start_cluster.')
+                    break
+                note = await when_unserved(counts)
+                if note is not None:
+                    break
+                interval = 0.5
         await asyncio.sleep(interval)
         interval = min(interval * 1.5, 5.0)
     return WaitResult(done=counts.done, counts=counts, waited_seconds=round(time.monotonic() - started, 1), note=note)

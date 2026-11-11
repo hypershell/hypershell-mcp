@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from pathlib import Path
 from typing import Annotated, Literal
 
 from fastmcp import FastMCP
@@ -107,9 +106,10 @@ def register(mcp: FastMCP, app: App) -> None:
                 description="Dotted name of the value, e.g. 'task.timeout', 'server.attempts', "
                             "'client.heartrate'.")],
             value: Annotated[str | int | float | bool, Field(description='The new value.')],
-            scope: Annotated[Literal['user', 'local', 'system'], Field(
-                description="Which configuration file to write: 'user' (this user's HyperShell "
-                            "config), 'local' (the site's own file) or 'system'.")] = 'user') -> AdminResult:
+            scope: Annotated[Literal['user', 'local', 'system'] | None, Field(
+                description="Which configuration file to write: 'local' (this site's own file), 'user' "
+                            "(this user's HyperShell config) or 'system'. Default: local when the site "
+                            'has its own file, otherwise user.')] = None) -> AdminResult:
         """
         Write one value to a HyperShell configuration file. It applies to HyperShell processes
         started afterwards, such as the next cluster; this server and anything already running
@@ -122,8 +122,13 @@ def register(mcp: FastMCP, app: App) -> None:
             raise BackendError("The mcp section holds this server's own security settings and is not "
                                'changeable through the server. Edit the configuration file directly.')
         text = str(value).lower() if isinstance(value, bool) else str(value)
+        if scope is None:
+            _, local = await app.hs('config', '--local', timeout=60)
+            scope = 'local' if local.strip() else 'user'
+        _, location = await app.hs('config', f'--{scope}', timeout=60)
+        if not location.strip():
+            raise BackendError(f'This site has no {scope} configuration file to write to.')
         status, output = await app.hs('config', 'set', key, text, f'--{scope}', timeout=60)
-        location, _ = await app.hs('config', f'--{scope}', timeout=60)
         return AdminResult(action='set_config', ok=status == 0,
-                           detail=(output or f'{key} = {text}')[-2000:],
-                           path=location.strip() if status == 0 and Path(location.strip()).name else None)
+                           detail=(output or f'{key} = {text} ({scope})')[-2000:],
+                           path=location.strip() if status == 0 else None)

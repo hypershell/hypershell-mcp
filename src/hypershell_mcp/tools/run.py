@@ -16,7 +16,7 @@ from hypershell_mcp.app import App
 from hypershell_mcp.auth import Tier
 from hypershell_mcp.backend import BackendError
 from hypershell_mcp.clusters import ClusterOptions
-from hypershell_mcp.models import ClusterInfo, RunResult, TaskResult, TaskSelector
+from hypershell_mcp.models import ClusterInfo, RunResult, StatusCounts, TaskResult, TaskSelector
 from hypershell_mcp.tools import tool
 from hypershell_mcp.tools.read import wait_until_done
 from hypershell_mcp.tools.write import Commands, Tags, Template, submit
@@ -24,15 +24,34 @@ from hypershell_mcp.tools.write import Commands, Tags, Template, submit
 __all__ = ['register']
 
 RESULTS_SHOWN = 50
+DRAIN_WAIT = 20.0
+"""Seconds an idle drain-mode cluster is given to exit before a new start is refused."""
+RESTARTS = 3
+"""Times run_tasks will start a cluster for one batch before it reports the problem instead."""
 
 
 def register(mcp: FastMCP, app: App) -> None:
     backend, limits = app.backend, app.settings.limits
 
     async def start(options: ClusterOptions, force: bool) -> ClusterInfo:
-        """Start a cluster unless another server is already working this database."""
+        """
+        Start a cluster, unless something is already working this database.
+
+        A drain-mode cluster lingers for a few seconds after its last task. If one is in that state
+        it is given time to exit (or to take up newly pending work, in which case it counts as
+        busy), so a caller who retries tasks and restarts straight away is not turned back by a
+        cluster that is on its way out.
+        """
+        deadline = time.monotonic() + DRAIN_WAIT
+        while time.monotonic() < deadline:
+            running = await asyncio.to_thread(app.clusters.running)
+            if not running or running[0].mode != 'drain':
+                break
+            if (await backend.call(backend.count, None)).running:
+                break
+            await asyncio.sleep(0.5)
         if not force and not await asyncio.to_thread(app.clusters.running):
-            queue = await backend.call(backend.queue)
+            queue = await app.queue()
             if queue.clients_connected:
                 raise BackendError(
                     f'{queue.clients_connected} client(s) are connected to a HyperShell server that this MCP '
@@ -73,32 +92,32 @@ def register(mcp: FastMCP, app: App) -> None:
         submitted = await submit(app, commands, template=template, tags=tags, group=None, zone=None, cores=None,
                                  memory=None, timeout=task_timeout, batch=None)
         selector = TaskSelector(batch=submitted.batch)
-        running = await asyncio.to_thread(app.clusters.running)
-        note = None
-        if running:
-            cluster = running[0]
-            if cluster.zone:
-                note = (f"The running cluster {cluster.id} serves zone '{cluster.zone}' only, so these tasks "
-                        'wait until a cluster without a zone runs.')
-        else:
-            cluster = await start(ClusterOptions(workers=workers, mode='drain', cwd=cwd), force=False)
-
         started = time.monotonic()
-        budget = float(min(timeout, limits.wait))
-        waited = await wait_until_done(app, ctx, selector, budget, watch_cluster=False)
-        while not waited.done and time.monotonic() - started < budget:
-            # The cluster ended with our tasks unfinished: either it was already draining when we
-            # submitted (start another), or it halted on something it could not get past.
-            if await asyncio.to_thread(app.clusters.running):
-                break
-            previous = await asyncio.to_thread(app.clusters.get, cluster.id, 15)
-            if previous.exit_code not in (0, None):
-                note = (f'Cluster {previous.id} stopped with exit status {previous.exit_code} before the tasks '
-                        'finished. Its log ends:\n' + '\n'.join(previous.log_tail[-8:]))
-                break
-            cluster = await start(ClusterOptions(workers=workers, mode='drain', cwd=cwd), force=False)
-            waited = await wait_until_done(app, ctx, selector, budget - (time.monotonic() - started),
-                                           watch_cluster=False)
+        used: list[ClusterInfo] = list(await asyncio.to_thread(app.clusters.running))
+        notes: list[str] = []
+        if used and used[0].zone:
+            notes.append(f"The running cluster {used[0].id} serves zone '{used[0].zone}' only, so these tasks "
+                         'wait until a cluster without a zone runs.')
+        starts = 0
+
+        async def serve(counts: StatusCounts) -> str | None:
+            """Nothing is running the batch: start a cluster, unless the last one failed."""
+            nonlocal starts
+            if used:
+                previous = await asyncio.to_thread(app.clusters.get, used[-1].id, 15)
+                if previous.exit_code not in (0, None):
+                    return (f'Cluster {previous.id} stopped with exit status {previous.exit_code} before the '
+                            'tasks finished. Its log ends:\n' + '\n'.join(previous.log_tail[-8:]))
+            if starts >= RESTARTS:
+                return (f'{counts.remaining} tasks are still unfinished after {starts} clusters started and '
+                        'exited without running them. list_clusters shows their logs.')
+            starts += 1
+            used.append(await start(ClusterOptions(workers=workers, mode='drain', cwd=cwd), force=False))
+            return None
+
+        waited = await wait_until_done(app, ctx, selector, float(min(timeout, limits.wait)), when_unserved=serve)
+        if waited.note:
+            notes.append(waited.note)
 
         _, rows = await backend.call(backend.select, selector, ['id', 'args', 'status', 'exit_status', 'duration'],
                                      'submit_time', False, RESULTS_SHOWN, 0)
@@ -115,14 +134,12 @@ def register(mcp: FastMCP, app: App) -> None:
                 result.stderr = err.text if err.available else None
                 result.truncated = out.truncated or err.truncated
             results.append(result)
-        if note is None:
-            note = waited.note
         if submitted.submitted > RESULTS_SHOWN:
-            extra = f'Showing {RESULTS_SHOWN} of {submitted.submitted} results; list_tasks with this batch has the rest.'
-            note = f'{note} {extra}' if note else extra
+            notes.append(f'Showing {RESULTS_SHOWN} of {submitted.submitted} results; list_tasks with this batch '
+                         'has the rest.')
         return RunResult(batch=submitted.batch, done=waited.done, counts=waited.counts,
-                         waited_seconds=round(time.monotonic() - started, 1), cluster=cluster.id,
-                         results=results, note=note)
+                         waited_seconds=round(time.monotonic() - started, 1),
+                         cluster=used[-1].id if used else None, results=results, note=' '.join(notes) or None)
 
     @tool(mcp, app, Tier.RUN, 'Start cluster', open_world=True)
     async def start_cluster(
@@ -139,10 +156,15 @@ def register(mcp: FastMCP, app: App) -> None:
         after this call returns and after this session ends.
 
         mode 'drain' (default) exits when no tasks remain; 'forever' keeps serving new submissions
-        until stop_cluster. One cluster runs per site at a time. Task output is always captured,
+        until stop_cluster. One cluster runs per site at a time: called without options while one
+        is already serving the queue, this returns that cluster. Task output is always captured,
         so get_task_output works for everything it runs. Follow progress with status or
         wait_for_tasks, and problems in list_clusters (its log).
         """
+        if options is None:
+            running = await asyncio.to_thread(app.clusters.running)
+            if running and (running[0].mode == 'forever' or (await backend.call(backend.count, None)).running):
+                return running[0]  # already serving the queue, which is all a bare call asks for
         return await start(options or ClusterOptions(), force)
 
     @tool(mcp, app, Tier.RUN, 'Stop cluster', destructive=True, idempotent=True)
