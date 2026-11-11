@@ -9,8 +9,9 @@ that behind 23 tools an agent can call, with typed results, over stdio for local
 with JWT authentication.
 
 > **Status: a spike.** Built against HyperShell 2.9.0a6 and FastMCP 4.1. It works end to end, has
-> a test suite that runs real clusters, and has been through one adversarial review, but it has
-> not been used in anger. See [`DESIGN.md`](DESIGN.md) for what was decided and what is still open.
+> a test suite that runs real clusters, and has been through two rounds of adversarial review, but
+> it has not been used in anger. See [`DESIGN.md`](DESIGN.md) for what was decided and what is
+> still open.
 
 ## What it looks like
 
@@ -91,8 +92,9 @@ claude mcp add --transport http hypershell http://127.0.0.1:8000/mcp \
 
 The server binds to `127.0.0.1` unless told otherwise, and it speaks plain HTTP: to reach it from
 another machine, put it behind TLS (a reverse proxy, or an SSH tunnel to the login node), since a
-bearer token is only as private as the connection it crosses. `GET /health` answers without a
-token, for monitors.
+bearer token is only as private as the connection it crosses. Bound to loopback, it accepts only
+requests addressed to itself; a reverse proxy on the same machine that passes the public `Host`
+through needs that name listed in `mcp.hosts`. `GET /health` answers without a token, for monitors.
 
 ## Tools
 
@@ -140,7 +142,8 @@ Tools that act on tasks share one `select` argument. Its fields are ANDed:
 
 `status` takes `pending`, `running`, `succeeded`, `failed`, `cancelled`, `completed` or
 `remaining`. A tag value of `null` means "has this tag". `where` conditions use
-`== != > >= < <= ~ !~` on any task field. Tools that change tasks refuse an empty selector unless
+`== != > >= < <= ~ !~` on any task field; `~` matches a regular expression in
+[RE2 syntax](https://github.com/google/re2/wiki/Syntax) (no backreferences or lookaround). Tools that change tasks refuse an empty selector unless
 told `everything: true`, and `delete_tasks` previews unless told `confirm: true`.
 
 ### Resources and prompts
@@ -188,15 +191,18 @@ What the server does on its own account:
   Python (`{= =}`) patterns would run inside the server for a caller who may only submit.
 - Task output is read only from the site's task-output directory (plus any listed in
   `mcp.outputs`), with symlinks resolved, because output paths are data in the database.
-- `get_config` masks keys, passwords, secrets and tokens, everything under `export`, and the
-  credentials and query string of any URL. `set_config` writes only an allow-list of scheduling and
-  limit settings: nothing that decides what runs or where data lives, and no `_eval` key.
-- Regular expressions from callers (`where … ~`, output search) are length-limited and run with a
-  deadline, so one caller's pattern cannot stall the server for the rest.
+- `get_config` masks keys, passwords, secrets and tokens, everything under `export` or under a
+  table with a secret-sounding name, and the credentials, query string and fragment of any URL.
+  `set_config` writes only an allow-list of scheduling and limit settings, each with a typed
+  value: nothing that decides what runs or where data lives, and no `_eval` key.
+- Regular expressions from callers (`where … ~`, output search) are matched by RE2, which runs in
+  time linear in the text and compiles within a fixed memory budget, and every read is stopped
+  after 30 seconds. One caller's pattern or query cannot stall the server for the rest.
+- Submissions are bounded: tasks per call, command length, template length, tags per task.
 - Bound to loopback, the HTTP server checks `Host` and `Origin`, which is what stops a web page
   from reaching a local server through DNS rebinding.
-- The server's own `HYPERSHELL_MCP_*` environment is stripped from every cluster it starts, so it
-  does not reach tasks.
+- The server's own `HYPERSHELL_MCP_*` environment, and any variable its configuration names with
+  `secret_env`, is stripped from every cluster it starts, so it does not reach tasks.
 - Every call outside the read tier is appended to `<site>/mcp/audit.jsonl`: time, token subject,
   tool, arguments, outcome. Denied calls are recorded too. Tasks submitted with a token are tagged
   `submitter:<subject>`.
@@ -214,6 +220,7 @@ port = 8000
 path = "/mcp"
 disable = ["admin"]           # tiers to switch off;  readonly = true  switches off all but read
 outputs = ["/scratch/hs/task"]   # extra directories task output may be read from
+hosts = ["hs.example.org"]    # Host names accepted besides the bind address (behind a local proxy)
 
 [mcp.jwt]
 secretfile = "~/.config/hypershell-mcp/secret"   # or: secret, pubkey (PEM or path), jwks (URL)
