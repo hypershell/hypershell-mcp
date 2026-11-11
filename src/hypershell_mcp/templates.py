@@ -37,10 +37,17 @@ import os
 import re
 from typing import Callable, Final
 
-__all__ = ['compile_template', 'TemplateError', 'PATTERNS']
+__all__ = ['compile_template', 'TemplateError', 'PATTERNS', 'TEMPLATE_LIMIT']
 
-PLACEHOLDER: Final[re.Pattern[str]] = re.compile(r'\{(.*?)\}')
-SLICE: Final[re.Pattern[str]] = re.compile(r'\[\s*(-?\d+)?\s*(:\s*(-?\d+)?\s*)?(:\s*(-?\d+)?\s*)?\]')
+TEMPLATE_LIMIT: Final[int] = 2000
+"""
+Longest template accepted. The patterns below are matched with ordinary backtracking, and a long
+run of ``{`` costs time quadratic in its length; at this size the worst case is milliseconds.
+"""
+
+PLACEHOLDER: Final[re.Pattern[str]] = re.compile(r'\{([^{}]*)\}')
+SLICE: Final[re.Pattern[str]] = re.compile(r'\[(-?\d{1,9})?(:(-?\d{1,9})?)?(:(-?\d{1,9})?)?\]')
+"""Matched against a key with its whitespace removed, so there is nothing for it to backtrack over."""
 
 PATTERNS: Final[dict[str, Callable[[str], str]]] = {
     '': lambda text: text,
@@ -60,7 +67,7 @@ class TemplateError(Exception):
 
 def word_picker(key: str) -> Callable[[str], str] | None:
     """An expander for ``[i]`` or ``[a:b:c]`` over the whitespace-separated words of the input."""
-    match = SLICE.fullmatch(key)
+    match = SLICE.fullmatch(''.join(key.split()))
     if match is None:
         return None
     first, second, stop, third, step = match.groups()
@@ -89,6 +96,8 @@ def compile_template(template: str) -> Callable[[str], str]:
 
     Raises `TemplateError` for a template that uses a shell or Python pattern.
     """
+    if len(template) > TEMPLATE_LIMIT:
+        raise TemplateError(f'the template is {len(template)} characters; the limit is {TEMPLATE_LIMIT}')
     pieces: list[str | Callable[[str], str]] = []
     position = 0
     for match in PLACEHOLDER.finditer(template):

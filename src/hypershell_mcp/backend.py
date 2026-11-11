@@ -57,6 +57,10 @@ POSTGRES_BUCKET: Final[dict[str, str]] = {'minute': 'YYYY-MM-DD HH24:MI', 'hour'
 OPERATORS: Final[tuple[str, ...]] = ('==', '!=', '>=', '<=', '!~', '>', '<', '~')
 WHERE: Final[re.Pattern[str]] = re.compile(r'^\s*([a-z_]+)\s*(==|!=|>=|<=|!~|>|<|~)\s*(.*?)\s*$')
 TAG_KEY: Final[re.Pattern[str]] = re.compile(r'^[A-Za-z0-9_.+-]{1,120}$')
+COMMAND_LIMIT: Final[int] = 65_536
+"""Longest command line stored for one task."""
+TAG_LIMIT: Final[int] = 64
+"""Most tags given in one call."""
 TAG_SCAN: Final[int] = 50_000
 """Most tasks read to list the tag keys of a selection."""
 PATTERN_LIMIT: Final[int] = 300
@@ -729,9 +733,15 @@ class Backend:
         for item in tasks:
             spec = item if isinstance(item, TaskSpec) else TaskSpec(command=item)
             cls.check_tags(spec.tags)
+            if len(spec.command) > COMMAND_LIMIT:
+                raise BackendError(f'a command is {len(spec.command)} characters; the limit is {COMMAND_LIMIT}. '
+                                   'Put long input in a file and pass its path.')
             command = expand(spec.command.strip())
             if not command:
                 raise BackendError('a command is empty')
+            if len(command) > COMMAND_LIMIT:
+                raise BackendError(f'the template made a command of {len(command)} characters; the limit is '
+                                   f'{COMMAND_LIMIT}')
             if '\n' in command or '\x00' in command:
                 raise BackendError('a command must be one line; join steps with && or submit a script path')
             try:
@@ -774,6 +784,8 @@ class Backend:
         `batch` is set through the batch argument at submit, and may be changed afterwards.
         """
         names = set(tags or {})
+        if len(names) > TAG_LIMIT:
+            raise BackendError(f'{len(names)} tags is more than a task may carry ({TAG_LIMIT})')
         for name in names:
             if not TAG_KEY.fullmatch(str(name)):
                 raise BackendError(f'invalid tag key {name!r}: use letters, digits and _ . + -')

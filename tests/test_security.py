@@ -61,6 +61,31 @@ def test_templates_only_rearrange_text():
         compile_template('{[::0]}')
 
 
+def test_a_hostile_template_cannot_take_long():
+    """Unclosed braces and padded slices once cost time quadratic in the template's length."""
+    with pytest.raises(TemplateError, match='limit is 2000'):
+        compile_template('{' * 100_000)
+    started = time.monotonic()
+    for hostile in ('{' * 2000, '{[' + ' ' * 1990 + 'x]}', '{' + ' ' * 1990 + '}', '{[' + '1:' * 900 + ']} {}',
+                    '{[' + '9' * 1900 + ']}'):
+        try:
+            compile_template(hostile)('a b c')
+        except TemplateError:
+            pass
+    assert time.monotonic() - started < 1
+    assert compile_template('{[ 1 : 3 ]}')('a b c d') == 'b c'
+
+
+async def test_submissions_are_bounded_in_size(client):
+    with pytest.raises(ToolError, match='limit is 65536'):
+        await client.call_tool('submit_tasks', {'commands': ['x' * 70_000]})
+    with pytest.raises(ToolError, match='limit is 65536'):
+        await client.call_tool('submit_tasks', {'commands': ['y' * 40_000], 'template': '{} {}'})
+    with pytest.raises(ToolError, match='more than a task may carry'):
+        await client.call_tool('submit_tasks', {'commands': ['x'], 'tags': {f'k{n}': n for n in range(65)}})
+    assert data(await client.call_tool('status', {}))['tasks']['total'] == 0
+
+
 async def test_dry_run_cannot_be_used_to_read_files(client, tmp_path):
     secret = tmp_path / 'secret.txt'
     secret.write_text('TOP-SECRET')
