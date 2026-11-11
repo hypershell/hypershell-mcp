@@ -281,3 +281,43 @@ async def test_every_tool_has_one_tier_a_title_and_a_description(client, local_s
         assert tool.output_schema, tool.name
         assert tool.annotations.read_only_hint is (tiers[tool.name].value == 'read'), tool.name
     assert {tool.name for tool in tools if tool.annotations.destructive_hint} == {'delete_tasks', 'stop_cluster'}
+
+
+async def test_dry_run_shows_what_would_be_stored_and_adds_nothing(client):
+    preview = await submit(client, ['data/a.fastq', 'b.fastq'], template='align {} > {/-}.bam', zone='gpu',
+                           dry_run=True)
+    assert preview['dry_run'] is True and preview['batch'] is None and preview['ids'] == []
+    assert (preview['submitted'], preview['would_submit']) == (0, 2)
+    assert preview['preview'] == ['align data/a.fastq > a.bam', 'align b.fastq > b.bam']
+    status = data(await client.call_tool('status', {}))
+    assert status['tasks']['total'] == 0 and status['queue']['zones_remaining'] == {}
+    with pytest.raises(ToolError, match='one line'):
+        await submit(client, ['ok', 'two\nlines'], dry_run=True)
+
+
+async def test_time_buckets_turn_a_summary_into_a_timeline(client):
+    from datetime import datetime
+
+    from hypershell.data.core import Session
+    from hypershell.data.model import Task
+    await submit(client, [f'job {n}' for n in range(5)])
+    moments = ['2026-11-01 09:05:00', '2026-11-01 09:40:00', '2026-11-01 10:10:00', '2026-11-02 08:00:00']
+    for n, moment in enumerate(moments):
+        when = datetime.fromisoformat(moment)
+        task = Session.query(Task).filter(Task.args == f'job {n}').one()
+        Task.update(task.id, schedule_time=when, start_time=when, completion_time=when,
+                    exit_status=0 if n != 2 else 1, duration=1)
+    Session.remove()
+
+    async def timeline(*group_by):
+        summary = data(await client.call_tool('summarize_tasks', {
+            'group_by': list(group_by), 'select': {'status': ['completed']}}))
+        return [(tuple(row['key'].values()), row['count']) for row in summary['rows']]
+
+    assert await timeline('completed:hour') == [(('2026-11-01 09:00',), 2), (('2026-11-01 10:00',), 1),
+                                                (('2026-11-02 08:00',), 1)]
+    assert await timeline('completed:day', 'status') == [(('2026-11-01', 'failed'), 1), (('2026-11-01', 'succeeded'), 2),
+                                                         (('2026-11-02', 'succeeded'), 1)]
+    assert len(await timeline('started:minute')) == 4
+    with pytest.raises(ToolError, match='time bucket'):
+        await client.call_tool('summarize_tasks', {'group_by': ['completed:week']})

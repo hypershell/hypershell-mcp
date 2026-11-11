@@ -140,10 +140,14 @@ class OutputChunk(Model):
 class SubmitResult(Model):
     """What a submission created."""
 
-    batch: Annotated[str, Field(
-        description='Handle for this submission: pass it as selector.batch to wait for, list, '
-                    'cancel or diagnose exactly these tasks.')]
+    batch: Annotated[str | None, Field(
+        description='Handle for this submission: pass it as select.batch to wait for, list, '
+                    'cancel or diagnose exactly these tasks. Null on a dry run.')]
     submitted: int
+    dry_run: bool = False
+    would_submit: Annotated[int | None, Field(description='On a dry run: how many tasks it would add.')] = None
+    preview: Annotated[list[str], Field(
+        description='On a dry run: the first 10 commands as they would be stored.')] = []
     group: Annotated[int | None, Field(description='The group the tasks went into, when they share one.')]
     zone: str
     ids: Annotated[list[str], Field(description='The new task ids (the first 100 when there are more).')]

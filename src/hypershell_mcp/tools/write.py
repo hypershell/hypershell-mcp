@@ -39,7 +39,8 @@ Everything = Annotated[bool, Field(
 
 async def submit(app: App, commands: list[str | TaskSpec], *, template: str | None,
                  tags: dict[str, Any] | None, group: int | None, zone: str | None, cores: int | None,
-                 memory: str | None, timeout: int | None, batch: str | None) -> SubmitResult:
+                 memory: str | None, timeout: int | None, batch: str | None,
+                 dry_run: bool = False) -> SubmitResult:
     """Submit tasks for the current caller (shared by submit_tasks and run_tasks)."""
     limit = app.settings.limits.submit
     if len(commands) > limit:
@@ -47,7 +48,7 @@ async def submit(app: App, commands: list[str | TaskSpec], *, template: str | No
                            'several calls, passing the same batch id to keep them together.')
     created = await app.backend.call(
         app.backend.submit, commands, template=template, tags=tags, group=group, zone=zone, cores=cores,
-        memory=memory, timeout=timeout, batch=batch, submitter=app.caller().subject)
+        memory=memory, timeout=timeout, batch=batch, submitter=app.caller().subject, dry_run=dry_run)
     ids = created.pop('ids')
     note = f'Showing the first 100 of {len(ids)} ids; list_tasks with this batch returns the rest.' if len(ids) > 100 else None
     return SubmitResult(**created, ids=ids[:100], note=note)
@@ -72,7 +73,11 @@ def register(mcp: FastMCP, app: App) -> None:
             timeout: Annotated[int | None, Field(ge=1, description='Wall-time limit per task, in seconds.')] = None,
             batch: Annotated[str | None, Field(
                 description='Batch id to file these tasks under, to add to an earlier submission. '
-                            'Default: a new id.')] = None) -> SubmitResult:
+                            'Default: a new id.')] = None,
+            dry_run: Annotated[bool, Field(
+                description='Check the submission and show the first commands as they would be '
+                            'stored, without adding anything. Worth doing before a large templated '
+                            'submission.')] = False) -> SubmitResult:
         """
         Add tasks to the queue. They run when a cluster serves the queue: one already running,
         one you start with start_cluster, or one someone starts elsewhere against this database.
@@ -84,7 +89,7 @@ def register(mcp: FastMCP, app: App) -> None:
         such as a parameter value.
         """
         return await submit(app, commands, template=template, tags=tags, group=group, zone=zone, cores=cores,
-                            memory=memory, timeout=timeout, batch=batch)
+                            memory=memory, timeout=timeout, batch=batch, dry_run=dry_run)
 
     @tool(mcp, app, Tier.MANAGE, 'Cancel tasks', idempotent=True)
     async def cancel_tasks(select: Select, dry_run: DryRun = False, everything: Everything = False) -> ChangeResult:

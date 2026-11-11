@@ -32,7 +32,7 @@ from typing import Any, Callable, Final, Iterable, TypeVar
 from hypershell_mcp.models import (STATES, DatabaseInfo, QueueInfo, StatusCounts, TagIndex,
                                    TaskGroupRow, TaskSelector, TaskSpec, TaskSummary)
 
-__all__ = ['Backend', 'BackendError', 'NotFound', 'lib', 'DEFAULT_FIELDS', 'GROUPABLE',
+__all__ = ['Backend', 'BackendError', 'NotFound', 'lib', 'DEFAULT_FIELDS', 'GROUPABLE', 'BUCKETS',
            'explain_exit_status', 'TEMPLATE_HELP']
 
 log = logging.getLogger('hypershell_mcp.backend')
@@ -43,6 +43,14 @@ DEFAULT_FIELDS: Final[tuple[str, ...]] = ('id', 'status', 'exit_status', 'args',
                                           'duration', 'client_host')
 GROUPABLE: Final[tuple[str, ...]] = ('status', 'group', 'zone', 'exit_status', 'client_host', 'server_host',
                                      'submit_host', 'attempt', 'part')
+BUCKETS: Final[dict[str, tuple[str, str]]] = {
+    f'{label}:{unit}': (column, unit)
+    for label, column in (('submitted', 'submit_time'), ('started', 'start_time'), ('completed', 'completion_time'))
+    for unit in ('minute', 'hour', 'day')}
+"""Time buckets a summary can group by, e.g. ``completed:hour``: the column and the unit."""
+SQLITE_BUCKET: Final[dict[str, str]] = {'minute': '%Y-%m-%d %H:%M', 'hour': '%Y-%m-%d %H:00', 'day': '%Y-%m-%d'}
+POSTGRES_BUCKET: Final[dict[str, str]] = {'minute': 'YYYY-MM-DD HH24:MI', 'hour': 'YYYY-MM-DD HH24:00',
+                                          'day': 'YYYY-MM-DD'}
 OPERATORS: Final[tuple[str, ...]] = ('==', '!=', '>=', '<=', '!~', '>', '<', '~')
 WHERE: Final[re.Pattern[str]] = re.compile(r'^\s*([a-z_]+)\s*(==|!=|>=|<=|!~|>|<|~)\s*(.*?)\s*$')
 TAG_KEY: Final[re.Pattern[str]] = re.compile(r'^[A-Za-z0-9_.+-]{1,120}$')
@@ -477,8 +485,14 @@ class Backend:
             elif name.startswith('tag:') and TAG_KEY.match(name[4:]):
                 key = name[4:]
                 keys.append(func.json_extract(Task.tag, f'$."{key}"') if sqlite else Task.tag[key].astext)
+            elif name in BUCKETS:
+                column, unit = BUCKETS[name]
+                moment = getattr(Task, column)
+                keys.append(func.strftime(SQLITE_BUCKET[unit], moment) if sqlite
+                            else func.to_char(func.date_trunc(unit, moment), POSTGRES_BUCKET[unit]))
             else:
-                raise BackendError(f"cannot group by {name!r}; choose from {', '.join(GROUPABLE)}, or tag:KEY")
+                raise BackendError(f"cannot group by {name!r}; choose from {', '.join(GROUPABLE)}, tag:KEY, or "
+                                   f"a time bucket such as completed:hour ({', '.join(BUCKETS)})")
         labelled = [key.label(f'key_{index}') for index, key in enumerate(keys)]
         conditions = cls.filters(selector)
         total = hs.Session.query(func.count(Task.id)).filter(*conditions).scalar() or 0
@@ -486,7 +500,10 @@ class Backend:
                                   func.max(Task.duration), func.sum(Task.duration), func.avg(Task.waited))
                  .filter(*conditions))
         if labelled:
-            query = query.group_by(*labelled).order_by(func.count(Task.id).desc(), *labelled)
+            # Largest groups first, unless the rows form a timeline, which reads in time order.
+            timeline = any(name in BUCKETS for name in group_by)
+            query = query.group_by(*labelled).order_by(*(labelled if timeline else
+                                                         (func.count(Task.id).desc(), *labelled)))
         records = query.limit(limit + 1).all()
         zones = cls.zone_names() if 'zone' in group_by else {}
         rows = []
@@ -592,7 +609,8 @@ class Backend:
     @classmethod
     def submit(cls, tasks: list[str | TaskSpec], *, template: str | None, tags: dict[str, Any] | None,
                group: int | None, zone: str | None, cores: int | None, memory: str | None,
-               timeout: int | None, batch: str | None, submitter: str | None) -> dict[str, Any]:
+               timeout: int | None, batch: str | None, submitter: str | None,
+               dry_run: bool = False) -> dict[str, Any]:
         """
         Add tasks to the database and return their ids.
 
@@ -627,7 +645,10 @@ class Backend:
             shared.setdefault('submitter', re.sub(r'[^A-Za-z0-9_.+-]', '_', submitter)[:120])
         if group is None:
             group = Task.current_group().value
-        zone_id = hs.Zone.ensure(hs.model.zone_name(zone)) if zone and zone != hs.DEFAULT_ZONE_NAME else None
+        zone_id = None
+        if zone and zone != hs.DEFAULT_ZONE_NAME:
+            name = hs.model.zone_name(zone)
+            zone_id = hs.model.zone_id(name) if dry_run else hs.Zone.ensure(name)
         source = hs.Source.reserved(hs.model.DIRECT_SOURCE_ID).id
         shared_memory = cls.parse_memory(memory)
 
@@ -650,12 +671,16 @@ class Backend:
                 raise
             except Exception as error:  # tag validation and friends raise assorted HyperShell errors
                 raise BackendError(f'cannot submit {spec.command!r}: {error}') from None
+        groups = {task.group for task in new}
+        result = {'batch': shared['batch'], 'submitted': len(new), 'ids': [task.id for task in new],
+                  'group': groups.pop() if len(groups) == 1 else None,
+                  'zone': zone if zone_id else hs.DEFAULT_ZONE_NAME, 'dry_run': dry_run,
+                  'preview': [task.args for task in new[:10]] if dry_run else []}
+        if dry_run:
+            return {**result, 'batch': None, 'submitted': 0, 'ids': [], 'would_submit': len(new)}
         for start in range(0, len(new), CHUNK):
             Task.add_all(new[start:start + CHUNK])
-        groups = {task.group for task in new}
-        return {'batch': shared['batch'], 'submitted': len(new), 'ids': [task.id for task in new],
-                'group': groups.pop() if len(groups) == 1 else None,
-                'zone': zone if zone_id else hs.DEFAULT_ZONE_NAME}
+        return {**result, 'would_submit': None}
 
     @staticmethod
     def parse_memory(text: str | None) -> int | None:

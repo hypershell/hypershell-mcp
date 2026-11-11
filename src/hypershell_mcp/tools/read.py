@@ -154,7 +154,9 @@ def register(mcp: FastMCP, app: App) -> None:
             select: Annotated[TaskSelector | None, Field(description='Which tasks. Omit for all.')] = None,
             group_by: Annotated[list[str], Field(
                 description='Dimensions to count by, any of: ' + ', '.join(GROUPABLE) +
-                            ", or 'tag:KEY' for a tag's value. An empty list gives one row of totals.")] = ['status'],
+                            ", 'tag:KEY' for a tag's value, or a time bucket: submitted:, started: or "
+                            'completed: with minute, hour or day (e.g. completed:hour). An empty list '
+                            'gives one row of totals.')] = ['status'],
             limit: Annotated[int, Field(ge=1, le=500, description='Most rows to return (largest first).')] = 50,
     ) -> TaskSummary:
         """
@@ -162,6 +164,8 @@ def register(mcp: FastMCP, app: App) -> None:
         duration statistics (seconds) for each row. This answers "how is the campaign going",
         "which hosts are slow", "which parameter values fail" in one call:
         group_by=['tag:model', 'status'], or ['client_host'] with select.status=['failed'].
+        A time bucket turns it into a timeline: ['completed:hour', 'status'] shows throughput and
+        when failures began.
         """
         return await backend.call(backend.summarize, select, group_by, limit)
 
